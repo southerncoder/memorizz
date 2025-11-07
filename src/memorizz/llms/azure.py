@@ -1,11 +1,11 @@
 # src/memorizz/llms/azure.py
 
-import os
-import json
-import openai
-import logging
 import inspect
-from typing import Callable, List, Optional, TYPE_CHECKING, Dict, Any
+import logging
+import os
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+
+import openai
 
 from .llm_provider import LLMProvider
 
@@ -14,17 +14,19 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # Use TYPE_CHECKING for forward references to avoid circular imports
 if TYPE_CHECKING:
-    from ..long_term_memory.procedural.toolbox.tool_schema import ToolSchemaType
+    pass
+
 
 class AzureOpenAI(LLMProvider):
     """
     A class for interacting with the Azure OpenAI API.
     """
+
     def __init__(
-        self, 
+        self,
         azure_endpoint: Optional[str] = None,
         api_version: Optional[str] = None,
-        deployment_name: str = "gpt-4o"
+        deployment_name: str = "gpt-4o",
     ):
         """
         Initialize the Azure OpenAI client.
@@ -63,7 +65,7 @@ class AzureOpenAI(LLMProvider):
             "provider": "azure",
             "deployment_name": self.model,
             "azure_endpoint": self.azure_endpoint,
-            "api_version": self.api_version
+            "api_version": self.api_version,
             # Note: We don't save the API key for security. It should be loaded from env vars.
         }
 
@@ -93,7 +95,7 @@ class AzureOpenAI(LLMProvider):
                 "You are an expert metadata augmentation assistant specializing in JSON schema discovery "
                 "and documentation enhancement.\n\n"
                 f"**IMPORTANT**: Use the function name exactly as provided (`{func_name}`) and do NOT rename it."
-            )
+            ),
         }
 
         user_msg = {
@@ -108,17 +110,15 @@ class AzureOpenAI(LLMProvider):
                 "• Identifying which parameters are required.\n"
                 "• (Optional) Suggesting example queries or use cases.\n\n"
                 "Produce a JSON object that strictly adheres to the ToolSchemaType structure."
-            )
+            ),
         }
 
         response = self.client.responses.parse(
-            model=self.model,
-            input=[system_msg, user_msg],
-            text_format=ToolSchemaType
+            model=self.model, input=[system_msg, user_msg], text_format=ToolSchemaType
         )
 
         return response.output_parsed
-    
+
     def augment_docstring(self, docstring: str) -> str:
         """
         Augment the docstring with an LLM generated description.
@@ -134,11 +134,11 @@ class AzureOpenAI(LLMProvider):
         """
         response = self.client.responses.create(
             model=self.model,
-            input=f"Augment the docstring {docstring} by adding more details and examples."
+            input=f"Augment the docstring {docstring} by adding more details and examples.",
         )
 
         return response.output_text
-    
+
     def generate_queries(self, docstring: str) -> List[str]:
         """
         Generate queries for the tool.
@@ -154,11 +154,11 @@ class AzureOpenAI(LLMProvider):
         """
         response = self.client.responses.create(
             model=self.model,
-            input=f"Generate queries for the docstring {docstring} by adding some examples of queries that can be used to leverage the tool."
+            input=f"Generate queries for the docstring {docstring} by adding some examples of queries that can be used to leverage the tool.",
         )
 
         return response.output_text
-    
+
     def generate_text(self, prompt: str, instructions: str = None) -> str:
         """
         Generate text using Azure OpenAI's API.
@@ -171,8 +171,41 @@ class AzureOpenAI(LLMProvider):
             str: The generated text.
         """
         response = self.client.responses.create(
-            model=self.model,
-            instructions=instructions,
-            input=prompt)
-        
+            model=self.model, instructions=instructions, input=prompt
+        )
+
         return response.output_text
+
+    def generate(
+        self,
+        messages: List[Dict[str, str]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: str = "auto",
+    ) -> Any:
+        """
+        Generate a response using Azure OpenAI's chat completions API.
+
+        Parameters:
+            messages (List[Dict[str, str]]): List of message dictionaries with 'role' and 'content'.
+                Example: [{"role": "system", "content": "..."}, {"role": "user", "content": "..."}]
+            tools (Optional[List[Dict[str, Any]]]): List of tool definitions for function calling.
+            tool_choice (str): Controls which (if any) function is called ("auto", "none", or specific function).
+
+        Returns:
+            Any: Either a string (final response) or the full response object (if tool calls are present).
+        """
+        kwargs = {"model": self.model, "messages": messages}
+
+        # Add tools if provided
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = tool_choice
+
+        response = self.client.chat.completions.create(**kwargs)
+
+        # If there are tool calls, return the full response object
+        if response.choices[0].message.tool_calls:
+            return response
+
+        # Otherwise return just the text content
+        return response.choices[0].message.content

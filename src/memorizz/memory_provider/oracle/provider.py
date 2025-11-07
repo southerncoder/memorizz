@@ -1,0 +1,2599 @@
+import array
+import json
+import logging
+import time
+import uuid
+from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+
+try:
+    import oracledb
+except ImportError:
+    raise ImportError(
+        "oracledb package is required for Oracle provider. "
+        "Install it with: pip install oracledb"
+    )
+
+from ...enums.memory_type import MemoryType
+from ...long_term_memory.semantic.persona.persona import Persona
+from ...long_term_memory.semantic.persona.role_type import RoleType
+from ...memagent import MemAgentModel
+from ..base import MemoryProvider
+
+if TYPE_CHECKING:
+    pass
+
+logger = logging.getLogger(__name__)
+
+
+@dataclass
+class OracleConfig:
+    """Configuration for the Oracle provider."""
+
+    def __init__(
+        self,
+        user: str,
+        password: str,
+        dsn: str,
+        schema: Optional[str] = None,
+        lazy_vector_indexes: bool = False,
+        embedding_provider=None,
+        embedding_config: Dict[str, Any] = None,
+        pool_min: int = 1,
+        pool_max: int = 5,
+        pool_increment: int = 1,
+    ):
+        """
+        Initialize the Oracle provider with configuration settings.
+
+        Parameters:
+        -----------
+        user : str
+            Oracle database username
+        password : str
+            Oracle database password
+        dsn : str
+            Oracle DSN (Data Source Name) or connection string
+            Examples:
+            - "localhost:1521/FREEPDB1"
+            - "myhost.example.com:1521/XEPDB1"
+            - Full TNS string
+        schema : str, optional
+            Schema name for tables (default: None, uses username as schema)
+        lazy_vector_indexes : bool
+            If True, vector indexes are created only when needed
+            If False, vector indexes are created immediately during initialization
+            Default: False
+        embedding_provider : str or EmbeddingManager, optional
+            Embedding provider to use. Can be:
+            - EmbeddingManager instance (explicit injection)
+            - String provider name ("openai", "ollama", "voyageai")
+            - None (uses global embedding configuration)
+        embedding_config : Dict[str, Any], optional
+            Configuration for the embedding provider
+            Example: {"model": "text-embedding-3-small", "dimensions": 512}
+        pool_min : int
+            Minimum number of connections in the pool (default: 1)
+        pool_max : int
+            Maximum number of connections in the pool (default: 5)
+        pool_increment : int
+            Number of connections to add when pool is exhausted (default: 1)
+        """
+        self.user = user
+        self.password = password
+        self.dsn = dsn
+        self.schema = schema if schema is not None else user
+        self.lazy_vector_indexes = lazy_vector_indexes
+        self.embedding_provider = embedding_provider
+        self.embedding_config = embedding_config or {}
+        self.pool_min = pool_min
+        self.pool_max = pool_max
+        self.pool_increment = pool_increment
+
+
+class OracleProvider(MemoryProvider):
+    """Oracle Database implementation of the MemoryProvider interface."""
+
+    def __init__(self, config: OracleConfig):
+        """
+        Initialize the Oracle provider with configuration settings.
+
+        Parameters:
+        -----------
+        config : OracleConfig
+            Configuration object containing connection parameters
+        """
+        self.config = config
+
+        # Initialize connection pool
+        try:
+            self.pool = oracledb.create_pool(
+                user=config.user,
+                password=config.password,
+                dsn=config.dsn,
+                min=config.pool_min,
+                max=config.pool_max,
+                increment=config.pool_increment,
+            )
+            logger.info("Oracle connection pool created successfully")
+        except Exception as e:
+            logger.error(f"Failed to create Oracle connection pool: {e}")
+            raise
+
+        # Track which vector indexes have been created
+        self._vector_indexes_created = set()
+
+        # Process embedding provider configuration
+        self._embedding_provider = self._setup_embedding_provider(config)
+
+        # Create all memory store tables
+        self._create_memory_stores()
+
+        # Create vector indexes immediately only if not using lazy initialization
+        if not config.lazy_vector_indexes:
+            try:
+                self._create_vector_indexes_for_memory_stores()
+            except Exception as e:
+                logger.warning(
+                    f"Failed to create vector indexes during initialization: {e}"
+                )
+                logger.info("Vector indexes will be created lazily when needed")
+                self.config.lazy_vector_indexes = True
+
+    def _setup_embedding_provider(self, config: OracleConfig):
+        """Setup the embedding provider based on configuration."""
+        if config.embedding_provider is None:
+            return None
+        elif isinstance(config.embedding_provider, str):
+            try:
+                from ...embeddings import EmbeddingManager
+
+                provider = EmbeddingManager(
+                    config.embedding_provider, config.embedding_config
+                )
+                # Sanitize provider info to remove sensitive data
+                provider_info = provider.get_provider_info()
+                sanitized_info = provider_info.copy()
+                if "config" in sanitized_info and isinstance(
+                    sanitized_info["config"], dict
+                ):
+                    sanitized_config = sanitized_info["config"].copy()
+                    # Remove sensitive keys
+                    for key in ["api_key", "apiKey", "API_KEY", "token", "password"]:
+                        if key in sanitized_config:
+                            sanitized_config[key] = "***REDACTED***"
+                    sanitized_info["config"] = sanitized_config
+                logger.info(f"Created embedding provider: {sanitized_info}")
+                return provider
+            except Exception as e:
+                logger.error(
+                    f"Failed to create embedding provider '{config.embedding_provider}': {e}"
+                )
+                raise
+        else:
+            return config.embedding_provider
+
+    def _get_embedding_provider(self):
+        """Get the embedding provider to use, with fallback logic."""
+        if self._embedding_provider is not None:
+            return self._embedding_provider
+        else:
+            from ...embeddings import get_embedding_manager
+
+            return get_embedding_manager()
+
+    def _get_embedding_dimensions_safe(self) -> int:
+        """Safely get embedding dimensions with error handling."""
+        try:
+            if self._embedding_provider is not None:
+                return self._embedding_provider.get_dimensions()
+            else:
+                from ...embeddings import get_embedding_dimensions
+
+                return get_embedding_dimensions()
+        except Exception as e:
+            logger.error(f"Failed to get embedding dimensions: {e}")
+            raise RuntimeError(
+                "Cannot determine embedding dimensions. Please configure embeddings first using:\n"
+                "configure_embeddings('openai', {'model': 'text-embedding-3-small', 'dimensions': 512})\n"
+                "Or use lazy_vector_indexes=True to defer vector index creation."
+            )
+
+    def _generate_embedding_if_needed(
+        self, content: str, existing_embedding=None
+    ) -> Optional[List[float]]:
+        """
+        Generate embedding for content if needed.
+
+        Args:
+            content: Text content to embed
+            existing_embedding: Existing embedding value (if any)
+
+        Returns:
+            Embedding vector or None
+        """
+        # If embedding already exists, use it
+        if existing_embedding is not None:
+            return existing_embedding
+
+        # If no embedding provider configured, return None
+        if self._embedding_provider is None:
+            return None
+
+        # If no content to embed, return None
+        if not content:
+            return None
+
+        # Generate embedding
+        try:
+            embedding = self._embedding_provider.get_embedding(content)
+            logger.debug(f"Generated embedding with {len(embedding)} dimensions")
+            return embedding
+        except Exception as e:
+            logger.warning(f"Failed to generate embedding: {e}")
+            return None
+
+    def _get_connection(self):
+        """Get a connection from the pool."""
+        return self.pool.acquire()
+
+    def _get_duality_view_name(self, memory_type: MemoryType) -> str:
+        """Get the Duality View name for a memory type."""
+        view_mapping = {
+            MemoryType.MEMAGENT: "agents_dv",
+            MemoryType.PERSONAS: "personas_dv",
+            MemoryType.TOOLBOX: "toolbox_dv",
+            MemoryType.CONVERSATION_MEMORY: "conversation_memory_dv",
+            MemoryType.LONG_TERM_MEMORY: "long_term_memory_dv",
+            MemoryType.SHORT_TERM_MEMORY: "short_term_memory_dv",
+            MemoryType.WORKFLOW_MEMORY: "workflow_memory_dv",
+            MemoryType.SHARED_MEMORY: "shared_memory_dv",
+            MemoryType.SUMMARIES: "summaries_dv",
+            MemoryType.SEMANTIC_CACHE: "semantic_cache_dv",
+        }
+        return view_mapping.get(memory_type, "unknown_dv")
+
+    def _get_table_name(self, memory_type: MemoryType) -> str:
+        """Get the table name for a memory type."""
+        return f"{self.config.schema}.{memory_type.value}"
+
+    def _create_memory_stores(self) -> None:
+        """Create all memory store tables in Oracle."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+
+            # Get embedding dimensions for vector columns
+            try:
+                dimensions = self._get_embedding_dimensions_safe()
+            except Exception:
+                # If dimensions not available yet, use placeholder
+                dimensions = 1536  # Common default
+                logger.warning(
+                    f"Using default dimensions {dimensions} for table creation"
+                )
+
+            for memory_type in MemoryType:
+                table_name = self._get_table_name(memory_type)
+
+                # Check if table exists
+                cursor.execute(
+                    """
+                    SELECT COUNT(*) FROM user_tables
+                    WHERE table_name = UPPER(:1)
+                    """,
+                    (memory_type.value,),
+                )
+                exists = cursor.fetchone()[0] > 0
+
+                if not exists:
+                    # Create table with appropriate schema
+                    create_sql = f"""
+                    CREATE TABLE {table_name} (
+                        id RAW(16) DEFAULT SYS_GUID() PRIMARY KEY,
+                        data CLOB CHECK (data IS JSON),
+                        embedding VECTOR({dimensions}, FLOAT32),
+                        name VARCHAR2(255),
+                        memory_id VARCHAR2(255),
+                        agent_id VARCHAR2(255),
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                    """
+                    try:
+                        cursor.execute(create_sql)
+                        conn.commit()
+                        logger.info(f"Created table: {table_name}")
+                    except Exception as e:
+                        logger.warning(f"Error creating table {table_name}: {e}")
+                        conn.rollback()
+
+            # Create indexes on commonly queried fields
+            self._create_standard_indexes(cursor, conn)
+
+    def _create_standard_indexes(self, cursor, conn):
+        """Create standard B-tree indexes on commonly queried fields."""
+        index_definitions = [
+            ("name", ["name"]),
+            ("memory_id", ["memory_id"]),
+            ("agent_id", ["agent_id"]),
+            ("created_at", ["created_at"]),
+        ]
+
+        for memory_type in MemoryType:
+            table_name = self._get_table_name(memory_type)
+
+            for idx_name, columns in index_definitions:
+                full_idx_name = f"idx_{memory_type.value}_{idx_name}"
+                try:
+                    cursor.execute(
+                        f"""
+                        CREATE INDEX {full_idx_name}
+                        ON {table_name} ({', '.join(columns)})
+                        """
+                    )
+                    conn.commit()
+                except Exception:
+                    # Index might already exist
+                    conn.rollback()
+
+    def _create_vector_indexes_for_memory_stores(self) -> None:
+        """Create vector indexes for all memory stores."""
+        for memory_type in MemoryType:
+            try:
+                self._ensure_vector_index(memory_type)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to create vector index for {memory_type.value}: {e}"
+                )
+
+    def _ensure_vector_index(self, memory_type: MemoryType):
+        """Ensure vector index exists for a memory type."""
+        index_key = f"{memory_type.value}_vector_index"
+
+        if index_key in self._vector_indexes_created:
+            return
+
+        table_name = self._get_table_name(memory_type)
+        index_name = f"idx_{memory_type.value}_vec"
+
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+
+            # Check if index exists
+            cursor.execute(
+                """
+                SELECT COUNT(*) FROM user_indexes
+                WHERE index_name = UPPER(:1)
+                """,
+                (index_name,),
+            )
+            exists = cursor.fetchone()[0] > 0
+
+            if not exists:
+                try:
+                    # Create vector index
+                    # Oracle 23ai+ supports HNSW and IVF indexes
+                    cursor.execute(
+                        f"""
+                        CREATE VECTOR INDEX {index_name}
+                        ON {table_name} (embedding)
+                        ORGANIZATION NEIGHBOR PARTITIONS
+                        DISTANCE COSINE
+                        WITH TARGET ACCURACY 95
+                        """
+                    )
+                    conn.commit()
+                    logger.info(f"Created vector index: {index_name}")
+                    self._vector_indexes_created.add(index_key)
+                except Exception as e:
+                    logger.warning(f"Failed to create vector index {index_name}: {e}")
+                    conn.rollback()
+            else:
+                self._vector_indexes_created.add(index_key)
+
+    def _doc_to_dict(
+        self, doc_data: str, include_embedding: bool = False
+    ) -> Dict[str, Any]:
+        """Convert JSON document to dictionary."""
+        if not doc_data:
+            return {}
+        result = json.loads(doc_data)
+        if not include_embedding and "embedding" in result:
+            del result["embedding"]
+        return result
+
+    def _dict_to_doc(self, data: Dict[str, Any]) -> str:
+        """Convert dictionary to JSON document."""
+        return json.dumps(data)
+
+    def store(
+        self,
+        data: Dict[str, Any] = None,
+        memory_store_type: MemoryType = None,
+        memory_id: str = None,
+        memory_unit: Any = None,
+    ) -> str:
+        """
+        Store data in Oracle.
+
+        Parameters:
+        -----------
+        data : Dict[str, Any], optional
+            The document to be stored (legacy parameter)
+        memory_store_type : MemoryType, optional
+            The type of memory store (legacy parameter)
+        memory_id : str, optional
+            The memory ID to associate with (new parameter)
+        memory_unit : MemoryUnit, optional
+            The memory unit object to store (new parameter)
+
+        Returns:
+        --------
+        str
+            The ID of the inserted/updated document
+        """
+        # Handle new calling style (memory_unit + memory_id)
+        if memory_unit is not None:
+            # Convert memory_unit to dict
+            if isinstance(memory_unit, dict):
+                data = memory_unit  # Already a dict, use as-is
+            elif hasattr(memory_unit, "model_dump"):
+                data = memory_unit.model_dump()
+            elif hasattr(memory_unit, "dict"):
+                data = memory_unit.dict()
+            elif hasattr(memory_unit, "__dict__"):
+                data = memory_unit.__dict__
+            else:
+                # Fallback: try to convert to dict
+                data = dict(memory_unit)
+
+            # Add memory_id if provided
+            if memory_id:
+                data["memory_id"] = memory_id
+
+            # Determine memory_store_type from memory_unit
+            if hasattr(memory_unit, "memory_type"):
+                memory_store_type = memory_unit.memory_type
+            elif "memory_type" in data:
+                memory_store_type = data["memory_type"]
+            else:
+                memory_store_type = MemoryType.CONVERSATION_MEMORY
+
+        # Validate we have required parameters
+        if data is None or memory_store_type is None:
+            raise ValueError(
+                "Either (data, memory_store_type) or (memory_unit) must be provided"
+            )
+
+        # Ensure memory_store_type is MemoryType enum
+        if isinstance(memory_store_type, str):
+            memory_store_type = MemoryType(memory_store_type)
+
+        # Dispatch to Duality View-based storage methods
+        if memory_store_type == MemoryType.MEMAGENT:
+            from ...memagent import MemAgentModel
+
+            agent = MemAgentModel(**data)
+            return self.store_memagent(agent)
+        elif memory_store_type == MemoryType.CONVERSATION_MEMORY:
+            return self._store_conversation_memory_dv(data)
+        elif memory_store_type == MemoryType.LONG_TERM_MEMORY:
+            return self._store_long_term_memory_dv(data)
+        elif memory_store_type == MemoryType.SHORT_TERM_MEMORY:
+            return self._store_short_term_memory_dv(data)
+        elif memory_store_type == MemoryType.WORKFLOW_MEMORY:
+            return self._store_workflow_memory_dv(data)
+        elif memory_store_type == MemoryType.SHARED_MEMORY:
+            return self._store_shared_memory_dv(data)
+        elif memory_store_type == MemoryType.SUMMARIES:
+            return self._store_summary_dv(data)
+        elif memory_store_type == MemoryType.SEMANTIC_CACHE:
+            return self._store_semantic_cache_dv(data)
+        else:
+            raise ValueError(f"Unsupported memory type: {memory_store_type}")
+
+    # ===== DUALITY VIEW-BASED STORAGE METHODS =====
+
+    def _store_with_duality_view(
+        self, view_name: str, data: Dict[str, Any], id_field: str = "memoryId"
+    ) -> str:
+        """Generic method to store data using a Duality View."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+
+            # Generate ID if not present
+            if not data.get(id_field):
+                data[id_field] = str(uuid.uuid4())
+
+            # Convert to JSON
+            json_doc = json.dumps(data)
+
+            try:
+                # Insert into Duality View
+                cursor.execute(
+                    f"INSERT INTO {view_name} VALUES (:json_doc)",
+                    {"json_doc": json_doc},
+                )
+            except Exception as e:
+                if "ORA-00001" in str(e):  # Unique constraint violation
+                    # Update existing document
+                    cursor.execute(
+                        f"""
+                        UPDATE {view_name}
+                        SET data = :json_doc
+                        WHERE {id_field} = :id
+                    """,
+                        {"json_doc": json_doc, "id": data[id_field]},
+                    )
+                else:
+                    raise
+
+            conn.commit()
+            return data[id_field]
+
+    def _store_conversation_memory_dv(self, data: Dict[str, Any]) -> str:
+        """Store conversation memory using Duality View."""
+        memory_data = {
+            "memoryId": data.get("memory_id") or str(uuid.uuid4()),
+            "conversationId": data.get("conversation_id"),
+            "role": data.get("role"),
+            "content": data.get("content"),
+            "timestamp": data.get("timestamp"),
+            "agentId": data.get("agent_id"),
+        }
+        # Auto-generate embedding if needed
+        embedding = self._generate_embedding_if_needed(
+            content=data.get("content", ""), existing_embedding=data.get("embedding")
+        )
+        if embedding is not None:
+            memory_data["embedding"] = embedding
+
+        return self._store_with_duality_view(
+            "conversation_memory_dv", memory_data, "memoryId"
+        )
+
+    def _store_long_term_memory_dv(self, data: Dict[str, Any]) -> str:
+        """Store long-term memory using Duality View."""
+        memory_data = {
+            "memoryId": data.get("memory_id") or str(uuid.uuid4()),
+            "content": data.get("content"),
+            "memoryType": data.get("memory_type"),
+            "importance": data.get("importance", 1.0),
+            "lastAccessed": data.get("last_accessed"),
+            "accessCount": data.get("access_count", 0),
+            "agentId": data.get("agent_id"),
+        }
+        # Auto-generate embedding if needed
+        embedding = self._generate_embedding_if_needed(
+            content=data.get("content", ""), existing_embedding=data.get("embedding")
+        )
+        if embedding is not None:
+            memory_data["embedding"] = embedding
+
+        return self._store_with_duality_view(
+            "long_term_memory_dv", memory_data, "memoryId"
+        )
+
+    def _store_short_term_memory_dv(self, data: Dict[str, Any]) -> str:
+        """Store short-term memory using Duality View."""
+        memory_data = {
+            "memoryId": data.get("memory_id") or str(uuid.uuid4()),
+            "content": data.get("content"),
+            "memoryType": data.get("memory_type"),
+            "ttl": data.get("ttl"),
+            "agentId": data.get("agent_id"),
+            "expiresAt": data.get("expires_at"),
+        }
+        # Auto-generate embedding if needed
+        embedding = self._generate_embedding_if_needed(
+            content=data.get("content", ""), existing_embedding=data.get("embedding")
+        )
+        if embedding is not None:
+            memory_data["embedding"] = embedding
+
+        return self._store_with_duality_view(
+            "short_term_memory_dv", memory_data, "memoryId"
+        )
+
+    def _store_workflow_memory_dv(self, data: Dict[str, Any]) -> str:
+        """Store workflow memory using Duality View (steps/outcome in separate columns)."""
+        workflow_id = data.get("workflow_id") or str(uuid.uuid4())
+
+        # First store via Duality View (excludes steps/outcome)
+        workflow_data = {
+            "workflowId": workflow_id,
+            "name": data.get("name"),
+            "description": data.get("description"),
+            "currentStep": data.get("current_step", 0),
+            "status": data.get("status", "pending"),
+            "memoryId": data.get("memory_id"),
+            "agentId": data.get("agent_id"),
+        }
+        # Auto-generate embedding if needed (use description as content)
+        embedding = self._generate_embedding_if_needed(
+            content=data.get("description", "") or data.get("name", ""),
+            existing_embedding=data.get("embedding"),
+        )
+        if embedding is not None:
+            workflow_data["embedding"] = embedding
+
+        self._store_with_duality_view("workflow_memory_dv", workflow_data, "workflowId")
+
+        # Then update steps/outcome in base table (excluded from Duality View)
+        if data.get("steps") or data.get("outcome"):
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                update_parts = []
+                params = {"workflow_id": workflow_id}
+
+                if data.get("steps"):
+                    update_parts.append("steps = :steps")
+                    params["steps"] = json.dumps(data["steps"])
+
+                if data.get("outcome"):
+                    update_parts.append("outcome = :outcome")
+                    params["outcome"] = json.dumps(data["outcome"])
+
+                if update_parts:
+                    cursor.execute(
+                        f"""
+                        UPDATE workflow_memory
+                        SET {', '.join(update_parts)}
+                        WHERE workflow_id = :workflow_id
+                    """,
+                        params,
+                    )
+                    conn.commit()
+
+        return workflow_id
+
+    def _store_shared_memory_dv(self, data: Dict[str, Any]) -> str:
+        """Store shared memory using Duality View (access_list in separate column)."""
+        memory_id = data.get("memory_id") or str(uuid.uuid4())
+
+        # Store via Duality View (excludes access_list)
+        shared_data = {
+            "memoryId": memory_id,
+            "content": data.get("content"),
+            "memoryType": data.get("memory_type"),
+            "scope": data.get("scope", "global"),
+            "ownerAgentId": data.get("owner_agent_id"),
+        }
+        # Auto-generate embedding if needed
+        embedding = self._generate_embedding_if_needed(
+            content=data.get("content", ""), existing_embedding=data.get("embedding")
+        )
+        if embedding is not None:
+            shared_data["embedding"] = embedding
+
+        self._store_with_duality_view("shared_memory_dv", shared_data, "memoryId")
+
+        # Update access_list in base table (excluded from Duality View)
+        if data.get("access_list"):
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    UPDATE shared_memory
+                    SET access_list = :access_list
+                    WHERE memory_id = :memory_id
+                """,
+                    {
+                        "access_list": json.dumps(data["access_list"]),
+                        "memory_id": memory_id,
+                    },
+                )
+                conn.commit()
+
+        return memory_id
+
+    def _store_summary_dv(self, data: Dict[str, Any]) -> str:
+        """Store summary using Duality View (original_memory_ids in separate column)."""
+        summary_id = data.get("summary_id") or str(uuid.uuid4())
+
+        # Store via Duality View (excludes original_memory_ids)
+        summary_data = {
+            "summaryId": summary_id,
+            "content": data.get("content"),
+            "summaryType": data.get("summary_type", "general"),
+            "memoryId": data.get("memory_id"),
+            "agentId": data.get("agent_id"),
+        }
+        # Auto-generate embedding if needed
+        embedding = self._generate_embedding_if_needed(
+            content=data.get("content", ""), existing_embedding=data.get("embedding")
+        )
+        if embedding is not None:
+            summary_data["embedding"] = embedding
+
+        self._store_with_duality_view("summaries_dv", summary_data, "summaryId")
+
+        # Update original_memory_ids in base table (excluded from Duality View)
+        if data.get("original_memory_ids"):
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    UPDATE summaries
+                    SET original_memory_ids = :original_memory_ids
+                    WHERE summary_id = :summary_id
+                """,
+                    {
+                        "original_memory_ids": json.dumps(data["original_memory_ids"]),
+                        "summary_id": summary_id,
+                    },
+                )
+                conn.commit()
+
+        return summary_id
+
+    def _store_semantic_cache_dv(self, data: Dict[str, Any]) -> str:
+        """Store semantic cache using Duality View."""
+        cache_data = {
+            "cacheKey": data.get("cache_key") or str(uuid.uuid4()),
+            "queryText": data.get("query_text"),
+            "response": data.get("response"),
+            "scope": data.get("scope", "global"),
+            "similarityThreshold": data.get("similarity_threshold", 0.8),
+            "hitCount": data.get("hit_count", 0),
+            "agentId": data.get("agent_id"),
+            "expiresAt": data.get("expires_at"),
+        }
+        # Auto-generate embedding if needed (use query_text as content)
+        embedding = self._generate_embedding_if_needed(
+            content=data.get("query_text", ""), existing_embedding=data.get("embedding")
+        )
+        if embedding is not None:
+            cache_data["embedding"] = embedding
+
+        return self._store_with_duality_view(
+            "semantic_cache_dv", cache_data, "cacheKey"
+        )
+
+    def retrieve_by_query(
+        self,
+        query: Union[Dict[str, Any], str],
+        memory_store_type: MemoryType = None,
+        limit: int = 1,
+        include_embedding: bool = False,
+        memory_id: str = None,
+        memory_type: Union[str, MemoryType] = None,
+        **kwargs,
+    ) -> Optional[List[Dict[str, Any]]]:
+        """
+        Retrieve documents from Oracle by query.
+
+        Parameters:
+        -----------
+        query : Union[Dict[str, Any], str]
+            The query to use for retrieval
+        memory_store_type : MemoryType, optional
+            The type of memory store (legacy parameter)
+        memory_type : Union[str, MemoryType], optional
+            The type of memory store (new parameter, takes precedence)
+        memory_id : str, optional
+            Filter results to specific memory_id
+        limit : int
+            The maximum number of documents to return
+        include_embedding : bool
+            Whether to include the embedding field in the results
+
+        Returns:
+        --------
+        Optional[List[Dict[str, Any]]]
+            The retrieved documents, or None if not found
+        """
+        # Handle new calling style: memory_type takes precedence over memory_store_type
+        if memory_type is not None:
+            if isinstance(memory_type, str):
+                memory_store_type = MemoryType(memory_type)
+            else:
+                memory_store_type = memory_type
+
+        if memory_store_type is None:
+            raise ValueError("Either memory_store_type or memory_type must be provided")
+
+        # If memory_id filter is provided, add it to the query
+        if memory_id is not None:
+            if isinstance(query, dict):
+                query = {**query, "memory_id": memory_id}
+            else:
+                # For string queries (semantic search), store memory_id for filtering
+                kwargs["memory_id"] = memory_id
+
+        # Handle special cases with vector search
+        if memory_store_type == MemoryType.PERSONAS:
+            return self.retrieve_persona_by_query(query, limit=limit)
+        elif memory_store_type == MemoryType.TOOLBOX:
+            return self.retrieve_toolbox_item(query, limit)
+        elif memory_store_type == MemoryType.WORKFLOW_MEMORY:
+            return self.retrieve_workflow_by_query(query, limit)
+        elif memory_store_type == MemoryType.SUMMARIES:
+            return self.retrieve_summaries_by_query(query, limit)
+        elif memory_store_type == MemoryType.SEMANTIC_CACHE:
+            if isinstance(query, dict):
+                # Filter query for loading existing cache entries
+                return self._retrieve_by_filter(
+                    query, memory_store_type, limit, include_embedding
+                )
+            else:
+                # String query for semantic similarity search
+                return self.find_similar_cache_entries(query, limit=limit, **kwargs)
+        else:
+            # Standard query
+            if isinstance(query, dict):
+                return self._retrieve_by_filter(
+                    query, memory_store_type, limit, include_embedding
+                )
+            else:
+                return []
+
+    def _retrieve_by_filter(
+        self,
+        query: Dict[str, Any],
+        memory_store_type: MemoryType,
+        limit: int,
+        include_embedding: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Retrieve documents by filter criteria using base tables (not Duality Views)."""
+        # For semantic cache and other complex queries, use base table
+        table_name = self._get_table_name(memory_store_type)
+
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+
+            # Build WHERE clause from query (using actual column names)
+            where_clauses = []
+            params = {}
+
+            for key, value in query.items():
+                if key != "_id":
+                    where_clauses.append(f"{key} = :{key}")
+                    params[key] = value
+
+            where_sql = " AND ".join(where_clauses) if where_clauses else "1=1"
+
+            # Select specific columns based on memory type
+            if memory_store_type == MemoryType.SEMANTIC_CACHE:
+                columns = "id, cache_key, query_text, response, scope, similarity_threshold, hit_count, agent_id, embedding, created_at, expires_at"
+            else:
+                columns = "*"
+
+            sql = f"""
+            SELECT {columns}
+            FROM {table_name}
+            WHERE {where_sql}
+            FETCH FIRST :limit ROWS ONLY
+            """
+
+            params["limit"] = limit
+            cursor.execute(sql, params)
+
+            results = []
+            for row in cursor:
+                # Convert row to dict based on memory type
+                if memory_store_type == MemoryType.SEMANTIC_CACHE:
+                    # Convert created_at to timestamp for compatibility with SemanticCacheEntry
+                    created_at = row[9]
+                    timestamp = (
+                        created_at.timestamp()
+                        if hasattr(created_at, "timestamp")
+                        else time.time()
+                    )
+
+                    # Handle CLOB columns - they return LOB objects that need to be read
+                    query_text = row[2].read() if hasattr(row[2], "read") else row[2]
+                    response = row[3].read() if hasattr(row[3], "read") else row[3]
+
+                    doc = {
+                        "_id": str(uuid.UUID(bytes=row[0])),
+                        "cache_key": row[1],
+                        "query_text": query_text,
+                        "response": response,
+                        "scope": row[4],
+                        "similarity_threshold": (
+                            float(row[5]) if row[5] is not None else 0.85
+                        ),
+                        "hit_count": int(row[6]) if row[6] is not None else 0,
+                        "usage_count": (
+                            int(row[6]) if row[6] is not None else 0
+                        ),  # Map hit_count to usage_count
+                        "agent_id": row[7],
+                        "timestamp": timestamp,
+                        "created_at": created_at,
+                        "expires_at": row[10],
+                    }
+                    if include_embedding and row[8] is not None:
+                        doc["embedding"] = list(row[8])
+                else:
+                    # Generic handling for other types
+                    doc = dict(zip([desc[0] for desc in cursor.description], row))
+                    if not include_embedding:
+                        doc.pop("embedding", None)
+
+                results.append(doc)
+
+            return results if results else None
+
+    def retrieve_by_id(
+        self, id: str, memory_store_type: MemoryType
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Retrieve a document from Oracle by ID using Duality View.
+
+        Parameters:
+        -----------
+        id : str
+            The document ID
+        memory_store_type : MemoryType
+            The type of memory store
+
+        Returns:
+        --------
+        Optional[Dict[str, Any]]
+            The retrieved document, or None if not found
+        """
+        # Special handling for MEMAGENT
+        if memory_store_type == MemoryType.MEMAGENT:
+            return self.retrieve_memagent(id)
+
+        view_name = self._get_duality_view_name(memory_store_type)
+        table_name = self._get_table_name(memory_store_type)
+
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+
+            # Try to query from Duality View first using string ID fields
+            try:
+                # Map memory types to their ID field names in Duality Views
+                id_field_map = {
+                    MemoryType.CONVERSATION_MEMORY: "memoryId",
+                    MemoryType.LONG_TERM_MEMORY: "memoryId",
+                    MemoryType.SHORT_TERM_MEMORY: "memoryId",
+                    MemoryType.WORKFLOW_MEMORY: "workflowId",
+                    MemoryType.SHARED_MEMORY: "memoryId",
+                    MemoryType.SUMMARIES: "summaryId",
+                    MemoryType.SEMANTIC_CACHE: "cacheKey",
+                }
+
+                id_field = id_field_map.get(memory_store_type, "memoryId")
+
+                cursor.execute(
+                    f'SELECT data FROM {view_name} WHERE "{id_field}" = :id', {"id": id}
+                )
+
+                row = cursor.fetchone()
+                if row:
+                    # Parse JSON from Duality View
+                    doc = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+                    # Convert camelCase to snake_case
+                    return self._convert_dv_to_dict(doc, memory_store_type)
+
+                return None
+            except Exception as e:
+                logger.warning(
+                    f"Duality View query failed, falling back to base table: {e}"
+                )
+                # Fallback to base table with UUID
+                try:
+                    doc_id = uuid.UUID(id).bytes
+                    cursor.execute(
+                        f"SELECT id, data FROM {table_name} WHERE id = :id",
+                        {"id": doc_id},
+                    )
+                    row = cursor.fetchone()
+                    if row:
+                        doc = self._doc_to_dict(row[1])
+                        doc["_id"] = str(uuid.UUID(bytes=row[0]))
+                        return doc
+                except Exception:
+                    pass
+
+                return None
+
+    def _convert_dv_to_dict(
+        self, doc: Dict[str, Any], memory_type: MemoryType
+    ) -> Dict[str, Any]:
+        """Convert Duality View JSON (camelCase) to Python dict (snake_case)."""
+        # Common conversions
+        result = {
+            "_id": doc.get("_id"),
+        }
+
+        # Memory type specific conversions
+        if memory_type == MemoryType.CONVERSATION_MEMORY:
+            result.update(
+                {
+                    "memory_id": doc.get("memoryId"),
+                    "conversation_id": doc.get("conversationId"),
+                    "role": doc.get("role"),
+                    "content": doc.get("content"),
+                    "timestamp": doc.get("timestamp"),
+                    "agent_id": doc.get("agentId"),
+                    "embedding": doc.get("embedding"),
+                }
+            )
+        elif memory_type == MemoryType.LONG_TERM_MEMORY:
+            result.update(
+                {
+                    "memory_id": doc.get("memoryId"),
+                    "content": doc.get("content"),
+                    "memory_type": doc.get("memoryType"),
+                    "importance": doc.get("importance"),
+                    "last_accessed": doc.get("lastAccessed"),
+                    "access_count": doc.get("accessCount"),
+                    "agent_id": doc.get("agentId"),
+                    "embedding": doc.get("embedding"),
+                    "created_at": doc.get("createdAt"),
+                    "updated_at": doc.get("updatedAt"),
+                }
+            )
+        elif memory_type == MemoryType.SHORT_TERM_MEMORY:
+            result.update(
+                {
+                    "memory_id": doc.get("memoryId"),
+                    "content": doc.get("content"),
+                    "memory_type": doc.get("memoryType"),
+                    "ttl": doc.get("ttl"),
+                    "agent_id": doc.get("agentId"),
+                    "embedding": doc.get("embedding"),
+                    "created_at": doc.get("createdAt"),
+                    "expires_at": doc.get("expiresAt"),
+                }
+            )
+        elif memory_type == MemoryType.WORKFLOW_MEMORY:
+            result.update(
+                {
+                    "workflow_id": doc.get("workflowId"),
+                    "name": doc.get("name"),
+                    "description": doc.get("description"),
+                    "current_step": doc.get("currentStep"),
+                    "status": doc.get("status"),
+                    "memory_id": doc.get("memoryId"),
+                    "agent_id": doc.get("agentId"),
+                    "embedding": doc.get("embedding"),
+                    "created_at": doc.get("createdAt"),
+                    "updated_at": doc.get("updatedAt"),
+                }
+            )
+        elif memory_type == MemoryType.SHARED_MEMORY:
+            result.update(
+                {
+                    "memory_id": doc.get("memoryId"),
+                    "content": doc.get("content"),
+                    "memory_type": doc.get("memoryType"),
+                    "scope": doc.get("scope"),
+                    "owner_agent_id": doc.get("ownerAgentId"),
+                    "embedding": doc.get("embedding"),
+                    "created_at": doc.get("createdAt"),
+                    "updated_at": doc.get("updatedAt"),
+                }
+            )
+        elif memory_type == MemoryType.SUMMARIES:
+            result.update(
+                {
+                    "summary_id": doc.get("summaryId"),
+                    "content": doc.get("content"),
+                    "summary_type": doc.get("summaryType"),
+                    "memory_id": doc.get("memoryId"),
+                    "agent_id": doc.get("agentId"),
+                    "embedding": doc.get("embedding"),
+                    "created_at": doc.get("createdAt"),
+                }
+            )
+        elif memory_type == MemoryType.SEMANTIC_CACHE:
+            result.update(
+                {
+                    "cache_key": doc.get("cacheKey"),
+                    "query_text": doc.get("queryText"),
+                    "response": doc.get("response"),
+                    "scope": doc.get("scope"),
+                    "similarity_threshold": doc.get("similarityThreshold"),
+                    "hit_count": doc.get("hitCount"),
+                    "agent_id": doc.get("agentId"),
+                    "embedding": doc.get("embedding"),
+                    "created_at": doc.get("createdAt"),
+                    "expires_at": doc.get("expiresAt"),
+                }
+            )
+
+        return result
+
+    def retrieve_by_name(
+        self, name: str, memory_store_type: MemoryType, include_embedding: bool = False
+    ) -> Optional[Dict[str, Any]]:
+        """Retrieve a document by name using Duality Views."""
+        view_name = self._get_duality_view_name(memory_store_type)
+
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+
+            cursor.execute(
+                f"""
+                SELECT data FROM {view_name}
+                WHERE name = :name
+                FETCH FIRST 1 ROWS ONLY
+                """,
+                {"name": name},
+            )
+
+            row = cursor.fetchone()
+            if row:
+                doc = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+                converted_doc = self._convert_dv_to_dict(doc, memory_store_type)
+                if not include_embedding:
+                    converted_doc.pop("embedding", None)
+                return converted_doc
+
+            return None
+
+    def delete_by_id(self, id: str, memory_store_type: MemoryType) -> bool:
+        """Delete a document by ID."""
+        table_name = self._get_table_name(memory_store_type)
+
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+
+            try:
+                doc_id = uuid.UUID(id).bytes
+            except (ValueError, Exception):
+                return False
+
+            cursor.execute(f"DELETE FROM {table_name} WHERE id = :id", {"id": doc_id})
+            conn.commit()
+
+            return cursor.rowcount > 0
+
+    def delete_by_name(self, name: str, memory_store_type: MemoryType) -> bool:
+        """Delete a document by name."""
+        table_name = self._get_table_name(memory_store_type)
+
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+
+            cursor.execute(
+                f"DELETE FROM {table_name} WHERE name = :name", {"name": name}
+            )
+            conn.commit()
+
+            return cursor.rowcount > 0
+
+    def delete_all(self, memory_store_type: MemoryType) -> bool:
+        """Delete all documents within a memory store type."""
+        table_name = self._get_table_name(memory_store_type)
+
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+
+            cursor.execute(f"DELETE FROM {table_name}")
+            conn.commit()
+
+            return cursor.rowcount > 0
+
+    def list_all(
+        self, memory_store_type: MemoryType, include_embedding: bool = False
+    ) -> List[Dict[str, Any]]:
+        """List all documents within a memory store type using Duality Views."""
+        view_name = self._get_duality_view_name(memory_store_type)
+
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+
+            cursor.execute(f"SELECT data FROM {view_name}")
+
+            results = []
+            for row in cursor:
+                doc = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+                # Convert to snake_case
+                converted_doc = self._convert_dv_to_dict(doc, memory_store_type)
+                if not include_embedding:
+                    converted_doc.pop("embedding", None)
+                results.append(converted_doc)
+
+            return results
+
+    def retrieve_conversation_history_ordered_by_timestamp(
+        self,
+        memory_id: str,
+        include_embedding: bool = False,
+        memory_type: Union[str, MemoryType] = None,
+        limit: int = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Retrieve conversation history ordered by timestamp.
+
+        Parameters:
+        -----------
+        memory_id : str
+            The memory ID to retrieve history for
+        include_embedding : bool
+            Whether to include embeddings
+        memory_type : Union[str, MemoryType], optional
+            Type of memory (defaults to CONVERSATION_MEMORY)
+        limit : int, optional
+            Maximum number of entries to return
+        """
+        # Default to CONVERSATION_MEMORY if not specified
+        if memory_type is None:
+            memory_type = MemoryType.CONVERSATION_MEMORY
+        elif isinstance(memory_type, str):
+            memory_type = MemoryType(memory_type)
+
+        # Query from base table for proper timestamp ordering
+        # (Duality Views don't support ORDER BY on JSON fields directly)
+        table_name = self._get_table_name(memory_type)
+
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+
+            # Build SQL to query base table with timestamp ordering
+            sql = f"""
+                SELECT id, memory_id, conversation_id, role, content, timestamp, agent_id, embedding
+                FROM {table_name}
+                WHERE memory_id = :memory_id
+                ORDER BY timestamp
+            """
+
+            if limit is not None:
+                sql += " FETCH FIRST :limit ROWS ONLY"
+                cursor.execute(sql, {"memory_id": memory_id, "limit": limit})
+            else:
+                cursor.execute(sql, {"memory_id": memory_id})
+
+            results = []
+            for row in cursor:
+                # Handle CLOB content properly
+                content = row[4]
+                if hasattr(content, "read"):
+                    content = content.read()
+
+                # Handle timestamp conversion
+                timestamp = row[5]
+                if hasattr(timestamp, "isoformat"):
+                    timestamp = timestamp.isoformat()
+                elif timestamp:
+                    timestamp = str(timestamp)
+
+                result = {
+                    "_id": str(uuid.UUID(bytes=row[0])),
+                    "memory_id": row[1],
+                    "conversation_id": row[2],
+                    "role": row[3],
+                    "content": content,
+                    "timestamp": timestamp,
+                    "agent_id": row[6],
+                }
+
+                if include_embedding and row[7] is not None:
+                    result["embedding"] = list(row[7])
+
+                results.append(result)
+
+            return results
+
+    def update_by_id(
+        self, id: str, data: Dict[str, Any], memory_store_type: MemoryType
+    ) -> bool:
+        """Update a document by ID."""
+        # For semantic cache, update base table directly (not Duality View)
+        if memory_store_type == MemoryType.SEMANTIC_CACHE:
+            return self._update_semantic_cache_by_key(id, data)
+
+        # For other types, use Duality Views
+        view_name = self._get_duality_view_name(memory_store_type)
+
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+
+            # Map memory types to their ID field names
+            id_field_map = {
+                MemoryType.MEMAGENT: "agentId",
+                MemoryType.CONVERSATION_MEMORY: "memoryId",
+                MemoryType.LONG_TERM_MEMORY: "memoryId",
+                MemoryType.SHORT_TERM_MEMORY: "memoryId",
+                MemoryType.WORKFLOW_MEMORY: "workflowId",
+                MemoryType.SHARED_MEMORY: "memoryId",
+                MemoryType.SUMMARIES: "summaryId",
+            }
+
+            id_field = id_field_map.get(memory_store_type, "memoryId")
+
+            # Get existing document from Duality View
+            cursor.execute(
+                f'SELECT data FROM {view_name} WHERE "{id_field}" = :id', {"id": id}
+            )
+            row = cursor.fetchone()
+
+            if not row:
+                return False
+
+            # Parse and merge with existing data
+            existing_doc = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+
+            # Convert update data from snake_case to camelCase
+            field_mapping = {
+                "memory_id": "memoryId",
+                "conversation_id": "conversationId",
+                "agent_id": "agentId",
+                "memory_type": "memoryType",
+                "workflow_id": "workflowId",
+                "current_step": "currentStep",
+                "owner_agent_id": "ownerAgentId",
+                "summary_id": "summaryId",
+                "summary_type": "summaryType",
+                "created_at": "createdAt",
+                "updated_at": "updatedAt",
+                "expires_at": "expiresAt",
+                "last_accessed": "lastAccessed",
+                "access_count": "accessCount",
+            }
+
+            for key, value in data.items():
+                camel_key = field_mapping.get(key, key)
+                existing_doc[camel_key] = value
+
+            # Update via Duality View
+            doc_json = json.dumps(existing_doc)
+
+            cursor.execute(
+                f"""
+                UPDATE {view_name}
+                SET data = :data
+                WHERE "{id_field}" = :id
+                """,
+                {"data": doc_json, "id": id},
+            )
+            conn.commit()
+
+            return cursor.rowcount > 0
+
+    def _update_semantic_cache_by_key(
+        self, id_value: str, data: Dict[str, Any]
+    ) -> bool:
+        """Update semantic cache entry directly in base table by id."""
+        table_name = self._get_table_name(MemoryType.SEMANTIC_CACHE)
+
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+
+            # Convert string UUID to bytes for Oracle RAW(16)
+            try:
+                id_bytes = uuid.UUID(id_value).bytes
+            except ValueError:
+                logger.error(
+                    f"Invalid UUID format for semantic cache update: {id_value}"
+                )
+                return False
+
+            # Build SET clause from data
+            set_clauses = []
+            params = {"id": id_bytes}
+
+            for key, value in data.items():
+                if key != "id":  # Don't update the id itself
+                    set_clauses.append(f"{key} = :{key}")
+                    params[key] = value
+
+            if not set_clauses:
+                return False
+
+            set_sql = ", ".join(set_clauses)
+
+            cursor.execute(
+                f"""
+                UPDATE {table_name}
+                SET {set_sql}
+                WHERE id = :id
+                """,
+                params,
+            )
+            conn.commit()
+
+            return cursor.rowcount > 0
+
+    def close(self) -> None:
+        """Close the connection pool."""
+        if hasattr(self, "pool"):
+            self.pool.close()
+            logger.info("Oracle connection pool closed")
+
+    # ===== VECTOR SEARCH METHODS =====
+
+    def retrieve_persona_by_query(
+        self, query: Dict[str, Any], limit: int = 1
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Retrieve personas using vector search."""
+        from ...embeddings import get_embedding
+
+        try:
+            embedding = get_embedding(query)
+        except Exception as e:
+            logger.error(f"Failed to generate embedding for query: {e}")
+            return []
+
+        return self._vector_search(MemoryType.PERSONAS, embedding, limit=limit)
+
+    def retrieve_toolbox_item(
+        self, query: Dict[str, Any], limit: int = 1
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Retrieve toolbox items using vector search."""
+        from ...embeddings import get_embedding
+
+        try:
+            embedding = get_embedding(query)
+        except Exception as e:
+            logger.error(f"Failed to generate embedding for query: {e}")
+            return []
+
+        return self._vector_search(MemoryType.TOOLBOX, embedding, limit=limit)
+
+    def retrieve_workflow_by_query(
+        self, query: Dict[str, Any], limit: int = 1
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Retrieve workflows using vector search."""
+        from ...embeddings import get_embedding
+
+        try:
+            embedding = get_embedding(query)
+        except Exception as e:
+            logger.error(f"Failed to generate embedding for query: {e}")
+            return []
+
+        return self._vector_search(MemoryType.WORKFLOW_MEMORY, embedding, limit=limit)
+
+    def retrieve_summaries_by_query(
+        self, query: Dict[str, Any], limit: int = 1
+    ) -> Optional[List[Dict[str, Any]]]:
+        """Retrieve summaries using vector search."""
+        from ...embeddings import get_embedding
+
+        try:
+            embedding = get_embedding(query)
+        except Exception as e:
+            logger.error(f"Failed to generate embedding for query: {e}")
+            return []
+
+        return self._vector_search(MemoryType.SUMMARIES, embedding, limit=limit)
+
+    def find_similar_cache_entries(
+        self, query: str, limit: int = 5, **kwargs
+    ) -> List[Dict[str, Any]]:
+        """Find semantically similar cache entries using vector search."""
+        from ...embeddings import get_embedding
+
+        try:
+            embedding = get_embedding(query)
+        except Exception as e:
+            logger.error(f"Failed to generate embedding for semantic cache query: {e}")
+            return []
+
+        # Extract filters
+        filters = {}
+        if "agent_id" in kwargs and kwargs["agent_id"] is not None:
+            filters["agent_id"] = kwargs["agent_id"]
+        if "memory_id" in kwargs and kwargs["memory_id"] is not None:
+            filters["memory_id"] = kwargs["memory_id"]
+        if "session_id" in kwargs and kwargs["session_id"] is not None:
+            filters["session_id"] = kwargs["session_id"]
+
+        return self._vector_search(
+            MemoryType.SEMANTIC_CACHE, embedding, limit=limit, filters=filters
+        )
+
+    def _vector_search(
+        self,
+        memory_type: MemoryType,
+        query_embedding: List[float],
+        limit: int = 5,
+        filters: Dict[str, Any] = None,
+        memory_id: str = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Perform vector similarity search using Oracle's VECTOR_DISTANCE function.
+
+        Parameters:
+        -----------
+        memory_type : MemoryType
+            The type of memory store to search
+        query_embedding : List[float]
+            The query embedding vector
+        limit : int
+            Maximum number of results to return
+        filters : Dict[str, Any]
+            Additional filter criteria
+        memory_id : str
+            Memory ID to filter by
+
+        Returns:
+        --------
+        List[Dict[str, Any]]
+            List of similar documents with scores
+        """
+        # Ensure vector index exists (lazy creation)
+        if self.config.lazy_vector_indexes:
+            self._ensure_vector_index(memory_type)
+
+        table_name = self._get_table_name(memory_type)
+
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+
+            # Build filter clauses
+            filter_clauses = []
+            params = {"limit": limit}
+
+            if memory_id:
+                filter_clauses.append("memory_id = :memory_id")
+                params["memory_id"] = memory_id
+
+            if filters:
+                for key, value in filters.items():
+                    filter_clauses.append(f"{key} = :{key}")
+                    params[key] = value
+
+            where_clause = " AND ".join(filter_clauses) if filter_clauses else "1=1"
+
+            # Oracle vector search using VECTOR_DISTANCE
+            # Note: Oracle returns distance (lower is better), we convert to score
+
+            # Semantic cache table has explicit columns (no 'data' CLOB)
+            if memory_type == MemoryType.SEMANTIC_CACHE:
+                sql = f"""
+                SELECT
+                    id, cache_key, query_text, response, scope,
+                    similarity_threshold, hit_count, agent_id, embedding,
+                    created_at, expires_at,
+                    (1 - VECTOR_DISTANCE(embedding, :query_vec, COSINE)) as score
+                FROM {table_name}
+                WHERE {where_clause}
+                ORDER BY VECTOR_DISTANCE(embedding, :query_vec, COSINE)
+                FETCH FIRST :limit ROWS ONLY
+                """
+            else:
+                sql = f"""
+                SELECT
+                    id,
+                    data,
+                    (1 - VECTOR_DISTANCE(embedding, :query_vec, COSINE)) as score
+                FROM {table_name}
+                WHERE {where_clause}
+                ORDER BY VECTOR_DISTANCE(embedding, :query_vec, COSINE)
+                FETCH FIRST :limit ROWS ONLY
+                """
+
+            # Convert Python list to array.array for Oracle VECTOR binding
+            # Use 'f' (float32) to match the VECTOR column format in Oracle
+            params["query_vec"] = array.array("f", query_embedding)
+
+            try:
+                cursor.execute(sql, params)
+
+                results = []
+                for row in cursor:
+                    if memory_type == MemoryType.SEMANTIC_CACHE:
+                        # Convert created_at to timestamp for compatibility with SemanticCacheEntry
+                        created_at = row[9]
+                        timestamp = (
+                            created_at.timestamp()
+                            if hasattr(created_at, "timestamp")
+                            else time.time()
+                        )
+
+                        # Handle CLOB columns - they return LOB objects that need to be read
+                        query_text = (
+                            row[2].read() if hasattr(row[2], "read") else row[2]
+                        )
+                        response = row[3].read() if hasattr(row[3], "read") else row[3]
+
+                        # Build doc from explicit columns
+                        doc = {
+                            "_id": str(uuid.UUID(bytes=row[0])),
+                            "cache_key": row[1],
+                            "query_text": query_text,
+                            "response": response,
+                            "scope": row[4],
+                            "similarity_threshold": (
+                                float(row[5]) if row[5] is not None else 0.85
+                            ),
+                            "hit_count": int(row[6]) if row[6] is not None else 0,
+                            "usage_count": (
+                                int(row[6]) if row[6] is not None else 0
+                            ),  # Map hit_count to usage_count
+                            "agent_id": row[7],
+                            "embedding": list(row[8]) if row[8] is not None else [],
+                            "timestamp": timestamp,
+                            "created_at": created_at,
+                            "expires_at": row[10],
+                            "score": float(row[11]),
+                        }
+                    else:
+                        # Parse from data column
+                        doc = self._doc_to_dict(row[1])
+                        doc["_id"] = str(uuid.UUID(bytes=row[0]))
+                        doc["score"] = float(row[2])
+
+                    results.append(doc)
+
+                return results
+            except Exception as e:
+                logger.error(f"Vector search failed: {e}")
+                return []
+
+    # ===== MEMAGENT METHODS =====
+
+    def store_memagent(self, memagent: "MemAgentModel") -> str:
+        """Store a memagent using JSON Relational Duality View."""
+        memagent_dict = memagent.model_dump()
+
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+
+            # Generate or use existing agent_id
+            agent_id_str = (
+                memagent_dict.get("_id")
+                or memagent_dict.get("agent_id")
+                or str(uuid.uuid4())
+            )
+
+            # Prepare JSON document for Duality View (NO nesting - standalone agent only)
+            agent_json = {
+                "agentId": agent_id_str,
+                "name": memagent_dict.get("name"),
+                "instruction": memagent_dict.get("instruction"),
+                "applicationMode": memagent_dict.get("application_mode", "assistant"),
+                "maxSteps": memagent_dict.get("max_steps", 20),
+                "toolAccess": memagent_dict.get("tool_access", "private"),
+                "semanticCache": 1 if memagent_dict.get("semantic_cache") else 0,
+                "verbose": 1 if memagent_dict.get("verbose") else 0,
+                "embedding": memagent_dict.get("embedding"),
+            }
+
+            # Insert/Update via Duality View - Oracle handles relational decomposition!
+            try:
+                cursor.execute(
+                    """
+                    INSERT INTO agents_dv VALUES (:json_doc)
+                """,
+                    {"json_doc": json.dumps(agent_json)},
+                )
+            except Exception as e:
+                if "ORA-00001" in str(
+                    e
+                ):  # Unique constraint violation - update instead
+                    # For updates, query existing _id then update
+                    cursor.execute(
+                        """
+                        SELECT _id FROM agents_dv WHERE agentId = :agent_id
+                    """,
+                        {"agent_id": agent_id_str},
+                    )
+                    row = cursor.fetchone()
+                    if row:
+                        agent_json["_id"] = row[0]
+                        cursor.execute(
+                            """
+                            UPDATE agents_dv
+                            SET data = :json_doc
+                            WHERE _id = :id
+                        """,
+                            {
+                                "json_doc": json.dumps(agent_json),
+                                "id": agent_json["_id"],
+                            },
+                        )
+                else:
+                    raise
+
+            # Get the internal UUID for foreign key relationships
+            cursor.execute(
+                "SELECT id FROM agents WHERE agent_id = :agent_id",
+                {"agent_id": agent_id_str},
+            )
+            row = cursor.fetchone()
+            agent_uuid = row[0] if row else uuid.UUID(agent_id_str).bytes
+
+            # Store persona separately using personas_dv
+            if memagent_dict.get("persona"):
+                persona = memagent_dict["persona"]
+                persona_dict = (
+                    persona.__dict__ if hasattr(persona, "__dict__") else persona
+                )
+
+                # Generate persona embedding
+                persona_text = f"{persona_dict.get('name', '')}: {persona_dict.get('background', '')} {persona_dict.get('goals', '')}"
+                persona_embedding = None
+                if self._embedding_provider and persona_text.strip():
+                    try:
+                        embedding_result = self._embedding_provider.get_embedding(
+                            persona_text
+                        )
+                        if embedding_result and isinstance(embedding_result, list):
+                            persona_embedding = embedding_result
+                    except Exception as e:
+                        logger.warning(f"Failed to generate embedding for persona: {e}")
+
+                persona_json = {
+                    "personaId": persona_dict.get("persona_id")
+                    or persona_dict.get("name", str(uuid.uuid4())),
+                    "name": persona_dict.get("name", "Unnamed Persona"),
+                    "roleType": (
+                        persona_dict.get("role")
+                        if isinstance(persona_dict.get("role"), str)
+                        else (
+                            persona_dict.get("role").value
+                            if hasattr(persona_dict.get("role"), "value")
+                            else "general"
+                        )
+                    ),
+                    "background": persona_dict.get("background", ""),
+                    "memoryId": persona_dict.get("memory_id"),
+                    "agentId": agent_id_str,  # Link to agent
+                    "embedding": persona_embedding,
+                }
+
+                # Remove None embedding to avoid vector errors
+                if persona_json["embedding"] is None:
+                    del persona_json["embedding"]
+
+                try:
+                    cursor.execute(
+                        "INSERT INTO personas_dv VALUES (:json_doc)",
+                        {"json_doc": json.dumps(persona_json)},
+                    )
+                except Exception as e:
+                    if "ORA-00001" in str(e):  # Already exists, update
+                        cursor.execute(
+                            """
+                            UPDATE personas_dv
+                            SET data = :json_doc
+                            WHERE personaId = :persona_id
+                        """,
+                            {
+                                "json_doc": json.dumps(persona_json),
+                                "persona_id": persona_json["personaId"],
+                            },
+                        )
+
+            # Store tools separately using toolbox_dv
+            if memagent_dict.get("tools"):
+                for tool_meta in memagent_dict["tools"]:
+                    # Generate tool embedding
+                    tool_text = f"{tool_meta.get('name', '')}: {tool_meta.get('description', '')} {tool_meta.get('signature', '')}"
+                    tool_embedding = None
+                    if self._embedding_provider and tool_text.strip():
+                        try:
+                            embedding_result = self._embedding_provider.get_embedding(
+                                tool_text
+                            )
+                            if embedding_result and isinstance(embedding_result, list):
+                                tool_embedding = embedding_result
+                        except Exception as e:
+                            logger.warning(
+                                f"Failed to generate embedding for tool: {e}"
+                            )
+
+                    tool_json = {
+                        "toolId": tool_meta.get("_id")
+                        or tool_meta.get("name", str(uuid.uuid4())),
+                        "name": tool_meta.get("name", "unknown_tool"),
+                        "description": tool_meta.get("description", ""),
+                        "signature": tool_meta.get("signature", ""),
+                        "docstring": tool_meta.get("docstring", ""),
+                        "toolType": tool_meta.get("type", "function"),
+                        "memoryId": tool_meta.get("memory_id"),
+                        "agentId": agent_id_str,  # Link to agent
+                        "embedding": tool_embedding,
+                    }
+
+                    # Remove None embedding to avoid vector errors
+                    if tool_json["embedding"] is None:
+                        del tool_json["embedding"]
+
+                    try:
+                        cursor.execute(
+                            "INSERT INTO toolbox_dv VALUES (:json_doc)",
+                            {"json_doc": json.dumps(tool_json)},
+                        )
+                    except Exception as e:
+                        if "ORA-00001" in str(e):  # Already exists, update
+                            cursor.execute(
+                                """
+                                UPDATE toolbox_dv
+                                SET data = :json_doc
+                                WHERE toolId = :tool_id
+                            """,
+                                {
+                                    "json_doc": json.dumps(tool_json),
+                                    "tool_id": tool_json["toolId"],
+                                },
+                            )
+
+            # Store LLM config (not in Duality View - in separate table)
+            if memagent_dict.get("llm_config"):
+                llm_config = memagent_dict["llm_config"]
+                llm_data = {
+                    "agent_id": agent_uuid,
+                    "provider": llm_config.get("provider", "openai"),
+                    "model": llm_config.get("model", "gpt-4o-mini"),
+                    "temperature": llm_config.get("temperature"),
+                    "max_tokens": llm_config.get("max_tokens"),
+                    "top_p": llm_config.get("top_p"),
+                    "frequency_penalty": llm_config.get("frequency_penalty"),
+                    "presence_penalty": llm_config.get("presence_penalty"),
+                    "additional_config": json.dumps(
+                        llm_config.get("additional_config", {})
+                    ),
+                }
+
+                try:
+                    cursor.execute(
+                        """
+                        INSERT INTO agent_llm_configs (agent_id, provider, model, temperature,
+                                                       max_tokens, top_p, frequency_penalty,
+                                                       presence_penalty, additional_config)
+                        VALUES (:agent_id, :provider, :model, :temperature, :max_tokens,
+                               :top_p, :frequency_penalty, :presence_penalty, :additional_config)
+                    """,
+                        llm_data,
+                    )
+                except Exception as e:
+                    if "ORA-00001" in str(e):
+                        cursor.execute(
+                            """
+                            UPDATE agent_llm_configs
+                            SET provider = :provider, model = :model, temperature = :temperature,
+                                max_tokens = :max_tokens, top_p = :top_p,
+                                frequency_penalty = :frequency_penalty,
+                                presence_penalty = :presence_penalty,
+                                additional_config = :additional_config
+                            WHERE agent_id = :agent_id
+                        """,
+                            llm_data,
+                        )
+
+            # Store memory_ids (many-to-many relationship table)
+            if memagent_dict.get("memory_ids"):
+                cursor.execute(
+                    "DELETE FROM agent_memories WHERE agent_id = :agent_id",
+                    {"agent_id": agent_uuid},
+                )
+                for memory_id in memagent_dict["memory_ids"]:
+                    cursor.execute(
+                        """
+                        INSERT INTO agent_memories (agent_id, memory_id)
+                        VALUES (:agent_id, :memory_id)
+                    """,
+                        {"agent_id": agent_uuid, "memory_id": memory_id},
+                    )
+
+            # Store delegates (many-to-many relationship table)
+            if memagent_dict.get("delegates"):
+                cursor.execute(
+                    "DELETE FROM agent_delegates WHERE agent_id = :agent_id",
+                    {"agent_id": agent_uuid},
+                )
+                for delegate_id in memagent_dict["delegates"]:
+                    try:
+                        delegate_uuid = uuid.UUID(delegate_id).bytes
+                        cursor.execute(
+                            """
+                            INSERT INTO agent_delegates (agent_id, delegate_agent_id)
+                            VALUES (:agent_id, :delegate_agent_id)
+                        """,
+                            {
+                                "agent_id": agent_uuid,
+                                "delegate_agent_id": delegate_uuid,
+                            },
+                        )
+                    except Exception:
+                        pass
+
+            # Update IS JSON columns that can't be in Duality View
+            # Update persona traits/expertise if present
+            if memagent_dict.get("persona"):
+                persona = memagent_dict["persona"]
+                persona_dict = (
+                    persona.__dict__ if hasattr(persona, "__dict__") else persona
+                )
+                persona_id = persona_dict.get("persona_id") or persona_dict.get(
+                    "name", str(uuid.uuid4())
+                )
+
+                traits = persona_dict.get("traits")
+                expertise = persona_dict.get("expertise")
+                if traits or expertise:
+                    cursor.execute(
+                        """
+                        UPDATE personas
+                        SET traits = :traits, expertise = :expertise
+                        WHERE persona_id = :persona_id
+                    """,
+                        {
+                            "traits": json.dumps(traits) if traits else None,
+                            "expertise": json.dumps(expertise) if expertise else None,
+                            "persona_id": persona_id,
+                        },
+                    )
+
+            # Update tool parameters if present (IS JSON column)
+            if memagent_dict.get("tools"):
+                for tool_meta in memagent_dict["tools"]:
+                    if tool_meta.get("parameters"):
+                        tool_id = tool_meta.get("_id") or tool_meta.get("name")
+                        cursor.execute(
+                            """
+                            UPDATE toolbox
+                            SET parameters = :parameters
+                            WHERE tool_id = :tool_id
+                        """,
+                            {
+                                "parameters": json.dumps(
+                                    tool_meta.get("parameters", {})
+                                ),
+                                "tool_id": tool_id,
+                            },
+                        )
+
+            conn.commit()
+            return agent_id_str
+
+    def _persist_agent_tools(
+        self, agent_id: str, agent_uuid: bytes, tools: List[Dict[str, Any]]
+    ):
+        """
+        Persist agent tools to TOOLBOX table using Duality View.
+
+        Args:
+            agent_id: The agent's string ID
+            agent_uuid: The agent's binary UUID for FK relationships
+            tools: List of tool metadata dictionaries
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+
+            # First, delete existing tools for this agent (if tool_access is private)
+            cursor.execute(
+                """
+                DELETE FROM toolbox WHERE agent_id = :agent_id
+            """,
+                {"agent_id": agent_id},
+            )
+
+            # Insert each tool using Duality View (handles VECTOR type properly)
+            for tool_meta in tools:
+                # Generate embedding for the tool if embedding provider is available
+                tool_description = tool_meta.get("description", "")
+                tool_signature = tool_meta.get("signature", "")
+                tool_text = (
+                    f"{tool_meta.get('name', '')}: {tool_description} {tool_signature}"
+                )
+
+                embedding = None
+                if self._embedding_provider and tool_text.strip():
+                    try:
+                        embedding_result = self._embedding_provider.get_embedding(
+                            tool_text
+                        )
+                        if embedding_result and isinstance(embedding_result, list):
+                            embedding = embedding_result
+                    except Exception as e:
+                        logger.warning(
+                            f"Failed to generate embedding for tool {tool_meta.get('name')}: {e}"
+                        )
+
+                # Prepare data for Duality View (camelCase keys)
+                tool_dv_data = {
+                    "toolId": tool_meta.get("_id")
+                    or tool_meta.get("name", str(uuid.uuid4())),
+                    "name": tool_meta.get("name", "unknown_tool"),
+                    "description": tool_description,
+                    "signature": tool_signature,
+                    "docstring": tool_meta.get("docstring", ""),
+                    "toolType": tool_meta.get("type", "function"),
+                    "memoryId": tool_meta.get("memory_id"),
+                    "agentId": agent_id,  # Store agent_id as string
+                }
+
+                # Add embedding if available (Duality View handles vector types)
+                if embedding:
+                    tool_dv_data["embedding"] = embedding
+
+                try:
+                    # Insert via Duality View - handles VECTOR type correctly
+                    json_doc = json.dumps(tool_dv_data)
+                    cursor.execute(
+                        """
+                        INSERT INTO toolbox_dv VALUES (:json_doc)
+                    """,
+                        {"json_doc": json_doc},
+                    )
+
+                    # Update the parameters column separately (IS JSON constraint, not in DV)
+                    if tool_meta.get("parameters"):
+                        cursor.execute(
+                            """
+                            UPDATE toolbox
+                            SET parameters = :parameters
+                            WHERE tool_id = :tool_id
+                        """,
+                            {
+                                "parameters": json.dumps(
+                                    tool_meta.get("parameters", {})
+                                ),
+                                "tool_id": tool_dv_data["toolId"],
+                            },
+                        )
+
+                    logger.info(
+                        f"Persisted tool '{tool_meta.get('name')}' for agent {agent_id}"
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to persist tool {tool_meta.get('name')}: {e}")
+
+            conn.commit()
+
+    def _persist_agent_persona(self, agent_id: str, agent_uuid: bytes, persona: Any):
+        """
+        Persist agent persona to PERSONAS table using Duality View.
+
+        Args:
+            agent_id: The agent's string ID
+            agent_uuid: The agent's binary UUID for FK relationships
+            persona: Persona object or dictionary
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+
+            # First, delete existing persona for this agent (one persona per agent)
+            cursor.execute(
+                """
+                DELETE FROM personas WHERE agent_id = :agent_id
+            """,
+                {"agent_id": agent_id},
+            )
+
+            # Convert persona to dict if it's an object
+            if hasattr(persona, "__dict__"):
+                persona_dict = persona.__dict__
+            elif isinstance(persona, dict):
+                persona_dict = persona
+            else:
+                logger.warning(f"Persona has unexpected type: {type(persona)}")
+                return
+
+            # Generate embedding for the persona if embedding provider is available
+            persona_text = f"{persona_dict.get('name', '')}: {persona_dict.get('background', '')} {persona_dict.get('goals', '')}"
+
+            embedding = None
+            if self._embedding_provider and persona_text.strip():
+                try:
+                    embedding_result = self._embedding_provider.get_embedding(
+                        persona_text
+                    )
+                    if embedding_result and isinstance(embedding_result, list):
+                        embedding = embedding_result
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to generate embedding for persona {persona_dict.get('name')}: {e}"
+                    )
+
+            # Prepare data for Duality View (camelCase keys)
+            persona_dv_data = {
+                "personaId": persona_dict.get("persona_id")
+                or persona_dict.get("name", str(uuid.uuid4())),
+                "name": persona_dict.get("name", "Unnamed Persona"),
+                "roleType": (
+                    persona_dict.get("role")
+                    if isinstance(persona_dict.get("role"), str)
+                    else (
+                        persona_dict.get("role").value
+                        if hasattr(persona_dict.get("role"), "value")
+                        else "general"
+                    )
+                ),
+                "background": persona_dict.get("background", ""),
+                "memoryId": persona_dict.get("memory_id"),
+                "agentId": agent_id,  # Link to agent
+            }
+
+            # Add embedding if available (Duality View handles vector types)
+            if embedding:
+                persona_dv_data["embedding"] = embedding
+
+            try:
+                # Insert via Duality View - handles VECTOR type correctly
+                json_doc = json.dumps(persona_dv_data)
+                cursor.execute(
+                    """
+                    INSERT INTO personas_dv VALUES (:json_doc)
+                """,
+                    {"json_doc": json_doc},
+                )
+
+                # Update the traits and expertise columns separately (IS JSON constraints, not in DV)
+                traits = persona_dict.get("traits")
+                expertise = persona_dict.get("expertise")
+
+                if traits or expertise:
+                    cursor.execute(
+                        """
+                        UPDATE personas
+                        SET traits = :traits, expertise = :expertise
+                        WHERE persona_id = :persona_id
+                    """,
+                        {
+                            "traits": json.dumps(traits) if traits else None,
+                            "expertise": json.dumps(expertise) if expertise else None,
+                            "persona_id": persona_dv_data["personaId"],
+                        },
+                    )
+
+                logger.info(
+                    f"Persisted persona '{persona_dict.get('name')}' for agent {agent_id}"
+                )
+            except Exception as e:
+                logger.error(
+                    f"Failed to persist persona {persona_dict.get('name')}: {e}"
+                )
+
+            conn.commit()
+
+    def _retrieve_agent_persona(self, agent_id: str) -> Optional[Any]:
+        """
+        Retrieve the persona for an agent from PERSONAS table.
+
+        Args:
+            agent_id: The agent's string ID
+
+        Returns:
+            Persona object or None if no persona exists
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+
+            try:
+                # Query persona from personas table
+                cursor.execute(
+                    """
+                    SELECT persona_id, name, role_type, background, traits,
+                           expertise, memory_id, embedding
+                    FROM personas
+                    WHERE agent_id = :agent_id
+                """,
+                    {"agent_id": agent_id},
+                )
+
+                row = cursor.fetchone()
+                if not row:
+                    return None
+
+                # Import Persona and RoleType classes
+                from ...long_term_memory.semantic.persona.persona import (
+                    Persona,
+                    RoleType,
+                )
+
+                # Parse the row
+                persona_id = row[0]
+                name = row[1]
+                role_type_str = row[2]
+                background = row[3]
+                traits = json.loads(row[4]) if row[4] else None
+                expertise = json.loads(row[5]) if row[5] else None
+                # row[6] = memory_id (unused)
+                # row[7] = embedding (unused)
+
+                # Convert role_type string to RoleType enum
+                role = RoleType.GENERAL  # Default
+                for role_enum in RoleType:
+                    if role_enum.value == role_type_str:
+                        role = role_enum
+                        break
+
+                # Create Persona object
+                persona = Persona(
+                    name=name,
+                    role=role,
+                    goals=background,  # Using background as goals
+                    background=background,
+                    persona_id=persona_id,
+                )
+
+                # Add optional fields if available
+                if traits:
+                    persona.traits = traits
+                if expertise:
+                    persona.expertise = expertise
+
+                logger.info(f"Retrieved persona '{name}' for agent {agent_id}")
+                return persona
+
+            except Exception as e:
+                logger.error(f"Failed to retrieve persona for agent {agent_id}: {e}")
+                return None
+
+    def retrieve_tools_for_agent(
+        self,
+        agent_id: str,
+        tool_access: str = "private",
+        query: Optional[str] = None,
+        top_k: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """
+        Retrieve tools for an agent based on tool_access mode.
+
+        Args:
+            agent_id: The agent's ID
+            tool_access: 'private' or 'public'/'global'
+            query: Optional query for semantic tool search
+            top_k: Number of tools to retrieve (for public/semantic search)
+
+        Returns:
+            List of tool metadata dictionaries
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            tools = []
+
+            if tool_access == "private":
+                # Retrieve only tools belonging to this agent
+                cursor.execute(
+                    """
+                    SELECT tool_id, name, description, signature, docstring, tool_type,
+                           parameters, memory_id, embedding
+                    FROM toolbox
+                    WHERE agent_id = :agent_id
+                    ORDER BY created_at DESC
+                """,
+                    {"agent_id": agent_id},
+                )
+
+                for row in cursor.fetchall():
+                    tools.append(self._toolbox_row_to_dict(row))
+
+            elif tool_access in ("public", "global"):
+                # If query provided, use vector search for semantic matching
+                if query and self._embedding_provider:
+                    tools = self._retrieve_tools_by_semantic_search(query, top_k)
+                else:
+                    # Otherwise, retrieve all tools (or top_k most recent)
+                    cursor.execute(
+                        f"""
+                        SELECT tool_id, name, description, signature, docstring, tool_type,
+                               parameters, memory_id, embedding
+                        FROM toolbox
+                        ORDER BY created_at DESC
+                        FETCH FIRST {top_k} ROWS ONLY
+                    """
+                    )
+
+                    for row in cursor.fetchall():
+                        tools.append(self._toolbox_row_to_dict(row))
+
+            logger.info(
+                f"Retrieved {len(tools)} tools for agent {agent_id} (access: {tool_access})"
+            )
+            return tools
+
+    def _retrieve_tools_by_semantic_search(
+        self, query: str, top_k: int = 10
+    ) -> List[Dict[str, Any]]:
+        """
+        Retrieve tools using vector similarity search.
+
+        Args:
+            query: The search query
+            top_k: Number of tools to return
+
+        Returns:
+            List of tool metadata dictionaries
+        """
+        try:
+            # Generate embedding for the query
+            query_embedding = self._embedding_provider.get_embedding(query)
+            if not query_embedding or not isinstance(query_embedding, list):
+                logger.warning("Failed to generate query embedding for tool search")
+                return []
+
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+
+                # Use Oracle's VECTOR_DISTANCE for similarity search
+                # Convert Python list to array.array for Oracle VECTOR binding
+                # Use 'f' (float32) to match the VECTOR column format in Oracle
+                query_vec = array.array("f", query_embedding)
+
+                cursor.execute(
+                    f"""
+                    SELECT tool_id, name, description, signature, docstring, tool_type,
+                           parameters, memory_id, embedding,
+                           VECTOR_DISTANCE(embedding, :query_embedding, COSINE) as distance
+                    FROM toolbox
+                    WHERE embedding IS NOT NULL
+                    ORDER BY distance
+                    FETCH FIRST {top_k} ROWS ONLY
+                """,
+                    {"query_embedding": query_vec},
+                )
+
+                tools = []
+                for row in cursor.fetchall():
+                    # Note: row now has 10 elements (9 + distance)
+                    tool_dict = self._toolbox_row_to_dict(row[:9])  # First 9 columns
+                    tool_dict["similarity_distance"] = (
+                        float(row[9]) if row[9] is not None else None
+                    )
+                    tools.append(tool_dict)
+
+                logger.info(
+                    f"Found {len(tools)} tools via semantic search for query: {query[:50]}..."
+                )
+                return tools
+
+        except Exception as e:
+            logger.error(f"Semantic tool search failed: {e}")
+            return []
+
+    def _toolbox_row_to_dict(self, row: tuple) -> Dict[str, Any]:
+        """Convert a toolbox table row to a dictionary."""
+        return {
+            "_id": row[0] if row[0] else None,  # tool_id
+            "name": row[1] if row[1] else "unknown",
+            "description": row[2] if row[2] else "",
+            "signature": row[3] if row[3] else "",
+            "docstring": row[4] if row[4] else "",
+            "type": row[5] if row[5] else "function",
+            "parameters": json.loads(row[6]) if row[6] else {},
+            "memory_id": row[7] if row[7] else None,
+            "embedding": row[8] if row[8] else None,
+        }
+
+    def delete_memagent(self, agent_id: str, cascade: bool = False) -> bool:
+        """Delete a memagent from the memory provider."""
+        if cascade:
+            memagent = self.retrieve_memagent(agent_id)
+            if memagent is None:
+                raise ValueError(f"MemAgent with id {agent_id} not found")
+
+            # Delete all memory units associated with the memagent
+            for memory_id in memagent.memory_ids:
+                for memory_type in MemoryType:
+                    self._delete_memory_units_by_memory_id(memory_id, memory_type)
+
+        return self.delete_by_id(agent_id, MemoryType.MEMAGENT)
+
+    def update_memagent_memory_ids(self, agent_id: str, memory_ids: List[str]) -> bool:
+        """Update the memory_ids of a memagent."""
+        return self.update_by_id(
+            agent_id, {"memory_ids": memory_ids}, MemoryType.MEMAGENT
+        )
+
+    def delete_memagent_memory_ids(self, agent_id: str) -> bool:
+        """Delete the memory_ids of a memagent."""
+        return self.update_by_id(agent_id, {"memory_ids": []}, MemoryType.MEMAGENT)
+
+    def list_memagents(self) -> List["MemAgentModel"]:
+        """List all memagents in the Oracle database."""
+        documents = self.list_all(MemoryType.MEMAGENT)
+        agents = []
+
+        for doc in documents:
+            agent = MemAgentModel(
+                instruction=doc.get("instruction"),
+                application_mode=doc.get("application_mode", "assistant"),
+                max_steps=doc.get("max_steps"),
+                memory_ids=doc.get("memory_ids") or [],
+                agent_id=str(doc.get("_id")),
+                tools=doc.get("tools"),
+                long_term_memory_ids=doc.get("long_term_memory_ids"),
+                memory_provider=self,
+            )
+
+            # Construct persona if present
+            if doc.get("persona"):
+                persona_data = doc.get("persona")
+                role_str = persona_data.get("role")
+                role = None
+
+                for role_type in RoleType:
+                    if role_type.value == role_str:
+                        role = role_type
+                        break
+
+                if role is None:
+                    role = RoleType.GENERAL
+
+                agent.persona = Persona(
+                    name=persona_data.get("name"),
+                    role=role,
+                    goals=persona_data.get("goals"),
+                    background=persona_data.get("background"),
+                    persona_id=persona_data.get("persona_id"),
+                )
+
+            agents.append(agent)
+
+        return agents
+
+    def retrieve_memagent(self, agent_id: str) -> "MemAgentModel":
+        """Retrieve a memagent using JSON Relational Duality View."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+
+            # Query from base table (easier than Duality View for WHERE clauses)
+            cursor.execute(
+                """
+                SELECT id, agent_id, name, instruction, application_mode, max_steps,
+                       tool_access, semantic_cache, verbose, embedding, created_at, updated_at
+                FROM agents
+                WHERE agent_id = :agent_id
+            """,
+                {"agent_id": agent_id},
+            )
+
+            row = cursor.fetchone()
+            if not row:
+                return None
+
+            # Build agent JSON from row
+            agent_uuid = row[0]
+            agent_json = {
+                "agentId": row[1],
+                "name": row[2],
+                "instruction": row[3],
+                "applicationMode": row[4],
+                "maxSteps": row[5],
+                "toolAccess": row[6],
+                "semanticCache": row[7],
+                "verbose": row[8],
+                "embedding": row[9],
+                "createdAt": row[10].isoformat() if row[10] else None,
+                "updatedAt": row[11].isoformat() if row[11] else None,
+            }
+
+            # Query LLM config (not in Duality View)
+            llm_config = None
+            if agent_uuid:
+                cursor.execute(
+                    """
+                    SELECT provider, model, temperature, max_tokens, top_p,
+                           frequency_penalty, presence_penalty, additional_config
+                    FROM agent_llm_configs
+                    WHERE agent_id = :agent_id
+                """,
+                    {"agent_id": agent_uuid},
+                )
+                llm_row = cursor.fetchone()
+                if llm_row:
+                    llm_config = {
+                        "provider": llm_row[0],
+                        "model": llm_row[1],
+                        "temperature": llm_row[2],
+                        "max_tokens": llm_row[3],
+                        "top_p": llm_row[4],
+                        "frequency_penalty": llm_row[5],
+                        "presence_penalty": llm_row[6],
+                        "additional_config": (
+                            json.loads(llm_row[7]) if llm_row[7] else {}
+                        ),
+                    }
+
+                # Query memory_ids
+                cursor.execute(
+                    """
+                    SELECT memory_id FROM agent_memories
+                    WHERE agent_id = :agent_id
+                    ORDER BY created_at
+                """,
+                    {"agent_id": agent_uuid},
+                )
+                memory_ids = [row[0] for row in cursor.fetchall()]
+            else:
+                memory_ids = []
+
+            # Query persona separately from personas table
+            persona = None
+            cursor.execute(
+                """
+                SELECT persona_id, name, role_type, background, memory_id, traits, expertise
+                FROM personas
+                WHERE agent_id = :agent_id
+            """,
+                {"agent_id": agent_id},
+            )
+            persona_row = cursor.fetchone()
+
+            if persona_row:
+                from ...long_term_memory.semantic.persona.persona import (
+                    Persona,
+                    RoleType,
+                )
+
+                # Convert role_type string to enum
+                role_type_str = persona_row[2] or "general"
+                role = RoleType.GENERAL
+                for role_enum in RoleType:
+                    if role_enum.value == role_type_str:
+                        role = role_enum
+                        break
+
+                traits = json.loads(persona_row[5]) if persona_row[5] else None
+                expertise = json.loads(persona_row[6]) if persona_row[6] else None
+
+                persona = Persona(
+                    name=persona_row[1],
+                    role=role,
+                    goals=persona_row[3] or "",
+                    background=persona_row[3] or "",
+                    persona_id=persona_row[0],
+                )
+                if traits:
+                    persona.traits = traits
+                if expertise:
+                    persona.expertise = expertise
+
+            # Query tools separately from toolbox table
+            tool_access = agent_json.get("toolAccess", "private")
+            tools = None
+
+            if tool_access == "private":
+                cursor.execute(
+                    """
+                    SELECT tool_id, name, description, signature, docstring, tool_type, memory_id, parameters
+                    FROM toolbox
+                    WHERE agent_id = :agent_id
+                """,
+                    {"agent_id": agent_id},
+                )
+                tool_rows = cursor.fetchall()
+
+                if tool_rows:
+                    tools = []
+                    for tool_row in tool_rows:
+                        parameters = json.loads(tool_row[7]) if tool_row[7] else {}
+                        tool_dict = {
+                            "_id": tool_row[0],
+                            "name": tool_row[1],
+                            "description": tool_row[2] or "",
+                            "signature": tool_row[3] or "",
+                            "docstring": tool_row[4] or "",
+                            "type": tool_row[5] or "function",
+                            "memory_id": tool_row[6],
+                            "parameters": parameters,
+                        }
+                        tools.append(tool_dict)
+            elif tool_access in ("public", "global"):
+                # For public tools, load from all available tools
+                tools = self.retrieve_tools_for_agent(
+                    agent_id=agent_id, tool_access=tool_access, query=None, top_k=50
+                )
+
+            # Create MemAgentModel from JSON
+            memagent = MemAgentModel(
+                instruction=agent_json.get("instruction"),
+                application_mode=agent_json.get("applicationMode", "assistant"),
+                max_steps=agent_json.get("maxSteps", 20),
+                tool_access=tool_access,
+                memory_ids=memory_ids,
+                agent_id=agent_json.get("agentId"),
+                llm_config=llm_config,
+                tools=tools if tools else None,
+                persona=persona,
+                memory_provider=self,
+            )
+
+            return memagent
+
+    def _delete_memory_units_by_memory_id(
+        self, memory_id: str, memory_type: MemoryType
+    ):
+        """Delete all memory units associated with a memory_id."""
+        table_name = self._get_table_name(memory_type)
+
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"DELETE FROM {table_name} WHERE memory_id = :memory_id",
+                {"memory_id": memory_id},
+            )
+            conn.commit()

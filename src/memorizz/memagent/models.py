@@ -1,0 +1,61 @@
+"""Data models for MemAgent configuration and state."""
+
+from typing import Any, Dict, List, Optional, Union
+
+from pydantic import BaseModel, Field
+
+from .constants import DEFAULT_INSTRUCTION, DEFAULT_MAX_STEPS, DEFAULT_TOOL_ACCESS
+
+
+class MemAgentModel(BaseModel):
+    """Data model for persisting and loading MemAgent configuration."""
+
+    model: Optional[Any] = None
+    llm_config: Optional[Dict[str, Any]] = None  # Configuration for the LLM
+    agent_id: Optional[str] = None
+    tools: Optional[Union[List, Any]] = None
+    persona: Optional[Any] = None
+    instruction: Optional[str] = Field(default=DEFAULT_INSTRUCTION)
+    application_mode: Optional[str] = "assistant"
+    memory_types: Optional[
+        List[str]
+    ] = None  # Custom memory types that override application_mode defaults
+    max_steps: int = Field(default=DEFAULT_MAX_STEPS)
+    memory_ids: Optional[List[str]] = None
+    tool_access: Optional[str] = Field(default=DEFAULT_TOOL_ACCESS)
+    long_term_memory_ids: Optional[List[str]] = None
+    delegates: Optional[List[str]] = None  # Store delegate agent IDs
+    embedding_config: Optional[Dict[str, Any]] = None
+    semantic_cache: Optional[bool] = False  # Enable semantic cache
+    semantic_cache_config: Optional[
+        Union[Any, Dict[str, Any]]
+    ] = None  # Semantic cache configuration
+
+    model_config = {
+        "arbitrary_types_allowed": True  # Allow arbitrary types like Toolbox
+    }
+
+
+class MemAgentConfig:
+    """Configuration helper for MemAgent initialization."""
+
+    def __init__(
+        self,
+        instruction: str = DEFAULT_INSTRUCTION,
+        max_steps: int = DEFAULT_MAX_STEPS,
+        tool_access: str = DEFAULT_TOOL_ACCESS,
+        semantic_cache: bool = False,
+        **kwargs,
+    ):
+        self.instruction = instruction
+        self.max_steps = max_steps
+        self.tool_access = tool_access
+        self.semantic_cache = semantic_cache
+
+        # Store additional configuration
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Convert configuration to dictionary."""
+        return {k: v for k, v in self.__dict__.items() if not k.startswith("_")}

@@ -1,6 +1,3 @@
-from .shared_memory import SharedMemory, BlackboardEntry
+from .shared_memory import BlackboardEntry, SharedMemory
 
-__all__ = [
-    'SharedMemory',
-    'BlackboardEntry'
-] 
+__all__ = ["SharedMemory", "BlackboardEntry"]

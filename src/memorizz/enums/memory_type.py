@@ -1,7 +1,9 @@
 from enum import Enum
 
+
 class MemoryType(Enum):
     """Enum for different types of memory stores."""
+
     PERSONAS = "personas"
     TOOLBOX = "toolbox"
     SHORT_TERM_MEMORY = "short_term_memory"
@@ -11,4 +13,4 @@ class MemoryType(Enum):
     MEMAGENT = "agents"
     SHARED_MEMORY = "shared_memory"
     SUMMARIES = "summaries"
-    SEMANTIC_CACHE = "semantic_cache" 
+    SEMANTIC_CACHE = "semantic_cache"

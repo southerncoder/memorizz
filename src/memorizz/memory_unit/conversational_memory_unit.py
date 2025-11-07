@@ -1,5 +1,7 @@
-from pydantic import BaseModel
 from typing import Optional
+
+from pydantic import BaseModel
+
 
 class ConversationMemoryUnit(BaseModel):
     role: str
@@ -10,4 +12,3 @@ class ConversationMemoryUnit(BaseModel):
     embedding: list[float]
     recall_recency: Optional[float] = None
     associated_conversation_ids: Optional[list[str]] = None
-

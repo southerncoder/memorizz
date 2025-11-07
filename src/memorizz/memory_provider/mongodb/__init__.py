@@ -1,6 +1,6 @@
-from .provider import MongoDBProvider, MongoDBConfig
+from .provider import MongoDBConfig, MongoDBProvider
 
 __all__ = [
-    'MongoDBProvider',
-    'MongoDBConfig',
+    "MongoDBProvider",
+    "MongoDBConfig",
 ]

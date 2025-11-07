@@ -1,8 +1,9 @@
-import os
-import json
-import openai
+import inspect
 import logging
-from typing import Callable, List, Optional, TYPE_CHECKING, Dict, Any
+import os
+from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+
+import openai
 
 from .llm_provider import LLMProvider
 
@@ -11,13 +12,14 @@ logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # Use TYPE_CHECKING for forward references to avoid circular imports
 if TYPE_CHECKING:
-    from ..long_term_memory.procedural.toolbox.tool_schema import ToolSchemaType
-import inspect
+    pass
+
 
 class OpenAI(LLMProvider):
     """
     A class for interacting with the OpenAI API.
     """
+
     def __init__(self, api_key: Optional[str] = None, model: str = "gpt-4o"):
         """
         Initialize the OpenAI client.
@@ -34,13 +36,10 @@ class OpenAI(LLMProvider):
 
         self.client = openai.OpenAI(api_key=api_key)
         self.model = model
-        
+
     def get_config(self) -> Dict[str, Any]:
         """Returns a serializable configuration for the OpenAI provider."""
-        return {
-            "provider": "openai",
-            "model": self.model
-        }
+        return {"provider": "openai", "model": self.model}
 
     def get_tool_metadata(self, func: Callable) -> Dict[str, Any]:
         """
@@ -68,7 +67,7 @@ class OpenAI(LLMProvider):
                 "You are an expert metadata augmentation assistant specializing in JSON schema discovery "
                 "and documentation enhancement.\n\n"
                 f"**IMPORTANT**: Use the function name exactly as provided (`{func_name}`) and do NOT rename it."
-            )
+            ),
         }
 
         user_msg = {
@@ -83,17 +82,15 @@ class OpenAI(LLMProvider):
                 "• Identifying which parameters are required.\n"
                 "• (Optional) Suggesting example queries or use cases.\n\n"
                 "Produce a JSON object that strictly adheres to the ToolSchemaType structure."
-            )
+            ),
         }
 
         response = self.client.responses.parse(
-            model=self.model,
-            input=[system_msg, user_msg],
-            text_format=ToolSchemaType
+            model=self.model, input=[system_msg, user_msg], text_format=ToolSchemaType
         )
 
         return response.output_parsed
-    
+
     def augment_docstring(self, docstring: str) -> str:
         """
         Augment the docstring with an LLM generated description.
@@ -109,11 +106,11 @@ class OpenAI(LLMProvider):
         """
         response = self.client.responses.create(
             model=self.model,
-            input=f"Augment the docstring {docstring} by adding more details and examples."
+            input=f"Augment the docstring {docstring} by adding more details and examples.",
         )
 
         return response.output_text
-    
+
     def generate_queries(self, docstring: str) -> List[str]:
         """
         Generate queries for the tool.
@@ -129,11 +126,11 @@ class OpenAI(LLMProvider):
         """
         response = self.client.responses.create(
             model=self.model,
-            input=f"Generate queries for the docstring {docstring} by adding some examples of queries that can be used to leverage the tool."
+            input=f"Generate queries for the docstring {docstring} by adding some examples of queries that can be used to leverage the tool.",
         )
 
         return response.output_text
-    
+
     def generate_text(self, prompt: str, instructions: str = None) -> str:
         """
         Generate text using OpenAI's API.
@@ -146,8 +143,41 @@ class OpenAI(LLMProvider):
             str: The generated text.
         """
         response = self.client.responses.create(
-            model=self.model,
-            instructions=instructions,
-            input=prompt)
-        
+            model=self.model, instructions=instructions, input=prompt
+        )
+
         return response.output_text
+
+    def generate(
+        self,
+        messages: List[Dict[str, str]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        tool_choice: str = "auto",
+    ) -> Any:
+        """
+        Generate a response using OpenAI's chat completions API.
+
+        Parameters:
+            messages (List[Dict[str, str]]): List of message dictionaries with 'role' and 'content'.
+                Example: [{"role": "system", "content": "..."}, {"role": "user", "content": "..."}]
+            tools (Optional[List[Dict[str, Any]]]): List of tool definitions for function calling.
+            tool_choice (str): Controls which (if any) function is called ("auto", "none", or specific function).
+
+        Returns:
+            Any: Either a string (final response) or the full response object (if tool calls are present).
+        """
+        kwargs = {"model": self.model, "messages": messages}
+
+        # Add tools if provided
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = tool_choice
+
+        response = self.client.chat.completions.create(**kwargs)
+
+        # If there are tool calls, return the full response object
+        if response.choices[0].message.tool_calls:
+            return response
+
+        # Otherwise return just the text content
+        return response.choices[0].message.content

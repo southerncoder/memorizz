@@ -1,18 +1,22 @@
 import os
 import sys
+
 import pytest
 from dotenv import load_dotenv
-from scenario import Scenario, TestingAgent, scenario_cache
+from scenario import Scenario, TestingAgent
 
 # Add the project root to the Python path
-project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", ".."))
+project_root = os.path.abspath(
+    os.path.join(os.path.dirname(__file__), "..", "..", "..")
+)
 sys.path.insert(0, project_root)
 load_dotenv()
 
-from ..memagent import MemAgent
-from ..memory_provider.mongodb.provider import MongoDBConfig, MongoDBProvider
-
-
+from ..memagent import MemAgent  # noqa: E402
+from ..memory_provider.mongodb.provider import (  # noqa: E402
+    MongoDBConfig,
+    MongoDBProvider,
+)
 
 # Create a memory provider
 mongodb_config = MongoDBConfig(uri=os.environ["MONGODB_URI"])
@@ -22,6 +26,7 @@ Scenario.configure(testing_agent=TestingAgent(model="openai/gpt-4o-mini"))
 
 mem_agent = MemAgent(memory_provider=memory_provider)
 
+
 @pytest.mark.agent_test
 @pytest.mark.asyncio
 async def test_vegetarian_recipe_agent():
@@ -30,9 +35,7 @@ async def test_vegetarian_recipe_agent():
     def vegetarian_recipe_agent(message, context):
         # Call your agent here
         response = agent.run(message)
-        return {
-            "message": response
-        }
+        return {"message": response}
 
     # Define the scenario
     scenario = Scenario(

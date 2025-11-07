@@ -10,38 +10,38 @@
 </div>
 
 > **⚠️ IMPORTANT WARNING ⚠️**
-> 
+>
 > **MemoRizz is an EXPERIMENTAL library intended for EDUCATIONAL PURPOSES ONLY.**
-> 
+>
 > **Do NOT use in production environments or with sensitive data.**
-> 
+>
 > This library is under active development, has not undergone security audits, and may contain bugs or breaking changes in future releases.
 
 ## Overview
 
 **MemoRizz is a memory management framework for AI agents designed to create memory-augmented agents with explicit memory type allocation based on application mode.**
 
-The framework enables developers to build context-aware agents capable of sophisticated information retrieval and storage. 
+The framework enables developers to build context and memory aware agents capable of sophisticated information retrieval and storage.
 
 MemoRizz provides flexible single and multi-agent architectures that allow you to instantiate agents with specifically allocated memory types—whether episodic, semantic, procedural, or working memory—tailored to your application's operational requirements.
 
 
 **Why MemoRizz?**
 - 🧠 **Persistent Memory**: Your AI agents remember conversations across sessions
-- 🔍 **Semantic Search**: Find relevant information using natural language
+- 🔍 **Semantic Search**: Find relevant information using natural language with AI Vector Search
 - 🛠️ **Tool Integration**: Automatically discover and execute functions
 - 👤 **Persona System**: Create consistent, specialized agent personalities
-- 📊 **Vector Search**: MongoDB Atlas Vector Search for efficient retrieval
+- 🗄️ **Oracle AI Database**: Built-in integration with Oracle 23ai for advanced vector search and JSON Duality Views
 - ⚡ **Semantic Cache**: Speed up responses and reduce costs with intelligent caching
 
 ## Key Features
 
 - **Persistent Memory Management**: Long-term memory storage with semantic retrieval
 - **MemAgent System**: Complete AI agents with memory, personas, and tools
-- **MongoDB Integration**: Built on MongoDB Atlas with vector search capabilities
+- **Oracle AI Database Integration**: Leverages Oracle 23ai with native vector search and JSON Relational Duality Views
 - **Tool Registration**: Automatically convert Python functions into LLM-callable tools
 - **Persona Framework**: Create specialized agent personalities and behaviors
-- **Vector Embeddings**: Semantic similarity search across all stored information
+- **Vector Embeddings**: Semantic similarity search across all stored information using Oracle AI Vector Search
 - **Semantic Cache**: Intelligent query-response caching with vector similarity matching
 
 ## Installation
@@ -52,8 +52,45 @@ pip install memorizz
 
 ### Prerequisites
 - Python 3.7+
-- MongoDB Atlas account (or local MongoDB with vector search)
+- Oracle Database 23ai or higher (for AI Vector Search and JSON Duality Views)
 - OpenAI API key (for embeddings and LLM functionality)
+
+### Oracle Database Setup
+
+**Using Docker (Recommended for getting started):**
+
+```bash
+# Pull Oracle Database 23ai Free (with AI Vector Search)
+docker pull container-registry.oracle.com/database/free:latest
+
+# Run Oracle (takes 2-3 minutes to start)
+docker run -d \
+  --name oracle-memorizz \
+  -p 1521:1521 \
+  -e ORACLE_PWD=MyPassword123! \
+  container-registry.oracle.com/database/free:latest
+
+# Wait for database to be ready
+docker logs -f oracle-memorizz
+# Wait until you see: "DATABASE IS READY TO USE!"
+```
+
+**Quick Setup:**
+
+```bash
+# Clone the repository (if installing from source)
+git clone https://github.com/RichmondAlake/memorizz.git
+cd memorizz
+
+# Run the automated setup script
+python examples/setup_oracle_user.py
+```
+
+This script will:
+- Create the `memorizz_user` with all required privileges
+- Set up the relational schema (tables + indexes)
+- Create JSON Relational Duality Views
+- Verify the complete setup
 
 ## Quick Start
 
@@ -61,23 +98,39 @@ pip install memorizz
 
 ```python
 import os
-from memorizz.memory_provider.mongodb.provider import MongoDBConfig, MongoDBProvider
-from memorizz.memagent import MemAgent
-from memorizz.llms.openai import OpenAI
+from memorizz.memory_provider.oracle import OracleProvider, OracleConfig
+from memorizz.memagent.builders import MemAgentBuilder
 
 # Set up your API keys
 os.environ["OPENAI_API_KEY"] = "your-openai-api-key"
 
-# Configure MongoDB memory provider
-mongodb_config = MongoDBConfig(uri="your-mongodb-atlas-uri")
-memory_provider = MongoDBProvider(mongodb_config)
-
-# Create a MemAgent
-agent = MemAgent(
-    model=OpenAI(model="gpt-4"),
-    instruction="You are a helpful assistant with persistent memory.",
-    memory_provider=memory_provider
+# Configure Oracle memory provider
+oracle_config = OracleConfig(
+    user="memorizz_user",
+    password="SecurePass123!",
+    dsn="localhost:1521/FREEPDB1",
+    embedding_provider="openai",
+    embedding_config={
+        "model": "text-embedding-3-small",
+        "api_key": os.environ["OPENAI_API_KEY"]
+    }
 )
+oracle_provider = OracleProvider(oracle_config)
+
+# Create a MemAgent using the builder pattern
+agent = (MemAgentBuilder()
+    .with_instruction("You are a helpful assistant with persistent memory.")
+    .with_memory_provider(oracle_provider)
+    .with_llm_config({
+        "provider": "openai",
+        "model": "gpt-4o-mini",
+        "api_key": os.environ["OPENAI_API_KEY"]
+    })
+    .build()
+)
+
+# Save the agent to Oracle
+agent.save()
 
 # Start conversing - the agent will remember across sessions
 response = agent.run("Hello! My name is John and I'm a software engineer.")
@@ -91,7 +144,7 @@ print(response)  # Agent remembers John is a software engineer
 # Table of single agent and multi-agent setups, their descriptions, and links to example notebooks
 | Agent Type                | Description                                                                 | Example Notebook                                                                 |
 |---------------------------|-----------------------------------------------------------------------------|----------------------------------------------------------------------------------|
-| Single Agent              | A standalone agent with its own memory and persona, suitable for individual tasks | [Single Agent Example](examples/memagent_single_agent.ipynb)                      |
+| Single Agent              | A standalone agent with its own memory and persona, suitable for individual tasks | [Single Agent Example](examples/single_agent/memagent_single_agent_demo.ipynb)                      |
 | Multi-Agent               | A system of multiple agents collaborating, each with specialized roles and shared memory | [Multi-Agent Example](examples/memagents_multi_agents.ipynb)                        |
 
 
@@ -104,9 +157,9 @@ print(response)  # Agent remembers John is a software engineer
 | **Knowledge Base** | Semantic Memory | Persistent facts, concepts, and domain knowledge | [Knowledge Base Example](examples/knowledge_base.ipynb) |
 | **Toolbox** | Procedural Memory | Registered functions with semantic discovery for LLM execution | [Toolbox Example](examples/toolbox.ipynb) |
 | **Workflow** | Procedural Memory | Multi-step process orchestration and execution tracking | [Workflow Example](examples/workflow.ipynb) |
-| **Conversation Memory** | Episodic Memory | Interaction history and conversational context | [Single Agent Example](examples/memagent_single_agent.ipynb) |
+| **Conversation Memory** | Episodic Memory | Interaction history and conversational context | [Single Agent Example](examples/single_agent/memagent_single_agent_demo.ipynb) |
 | **Summaries** | Episodic Memory | Compressed episodic experiences and events | [Summarization Example](examples/memagent_summarisation.ipynb) |
-| **Working Memory** | Short-term Memory | Active context management and current session state | [Single Agent Example](examples/memagent_single_agent.ipynb) |
+| **Working Memory** | Short-term Memory | Active context management and current session state | [Single Agent Example](examples/single_agent/memagent_single_agent_demo.ipynb) |
 | **Semantic Cache** | Short-term Memory | Vector-based query-response caching for performance optimization | [Semantic Cache Demo](examples/semantic_cache.ipynb) |
 | **Shared Memory** | Multi-Agent Coordination | Blackboard for inter-agent communication and coordination | [Multi-Agent Example](examples/memagents_multi_agents.ipynb) |
 
@@ -114,19 +167,30 @@ print(response)  # Agent remembers John is a software engineer
 ### 2. Creating Specialized Agents with Personas
 
 ```python
-from memorizz.long_term_memory.semantic.persona import Persona
-from memorizz.long_term_memory.semantic.persona.role_type import RoleType
+from memorizz.long_term_memory.semantic.persona import Persona, RoleType
 
-# Create a technical expert persona using predefined role types
+# Create a technical expert persona
 tech_expert = Persona(
     name="TechExpert",
-    role=RoleType.TECHNICAL_EXPERT,  # Use predefined role enum
+    role=RoleType.TECHNICAL_EXPERT,
     goals="Help developers solve complex technical problems with detailed explanations.",
     background="10+ years experience in Python, AI/ML, and distributed systems."
 )
 
-# Apply persona to agent
-agent.set_persona(tech_expert)
+# Create agent with persona
+agent = (MemAgentBuilder()
+    .with_instruction("You are a technical expert assistant.")
+    .with_persona(tech_expert)
+    .with_memory_provider(oracle_provider)
+    .with_llm_config({
+        "provider": "openai",
+        "model": "gpt-4o",
+        "api_key": os.environ["OPENAI_API_KEY"]
+    })
+    .build()
+)
+
+# Save agent with persona to Oracle
 agent.save()
 
 # Now the agent will respond as a technical expert
@@ -136,36 +200,40 @@ response = agent.run("How should I design a scalable microservices architecture?
 ### 3. Tool Registration and Function Calling
 
 ```python
-from memorizz.database import MongoDBTools, MongoDBToolsConfig
-from memorizz.embeddings.openai import get_embedding
+import requests
 
-# Configure tools database
-tools_config = MongoDBToolsConfig(
-    mongo_uri="your-mongodb-atlas-uri",
-    db_name="my_tools_db",
-    get_embedding=get_embedding  # Required embedding function
+# Define a tool function
+def get_weather(latitude: float, longitude: float) -> float:
+    """Get the current temperature for a given latitude and longitude."""
+    response = requests.get(
+        f"https://api.open-meteo.com/v1/forecast"
+        f"?latitude={latitude}&longitude={longitude}"
+        f"&current=temperature_2m"
+    )
+    data = response.json()
+    return data['current']['temperature_2m']
+
+# Create agent with tools
+weather_agent = (MemAgentBuilder()
+    .with_instruction("You are a helpful weather assistant.")
+    .with_tool(get_weather)
+    .with_memory_provider(oracle_provider)
+    .with_llm_config({
+        "provider": "openai",
+        "model": "gpt-4o",
+        "api_key": os.environ["OPENAI_API_KEY"]
+    })
+    .build()
 )
 
-# Register tools using decorator
-with MongoDBTools(tools_config) as tools:
-    toolbox = tools.mongodb_toolbox()
-    
-    @toolbox
-    def calculate_compound_interest(principal: float, rate: float, time: int) -> float:
-        """Calculate compound interest for financial planning."""
-        return principal * (1 + rate) ** time
-    
-    @toolbox
-    def get_weather(city: str) -> str:
-        """Get current weather for a city."""
-        # Your weather API integration here
-        return f"Weather in {city}: 72°F, sunny"
-    
-    # Add tools to your agent
-    agent.add_tool(toolbox=toolbox)
-    
-    # Agent can now discover and use these tools automatically
-    response = agent.run("What's the weather in San Francisco and calculate interest on $1000 at 5% for 3 years?")
+# Save agent (tools are persisted to Oracle)
+weather_agent.save()
+
+# Agent automatically discovers and uses tools
+response = weather_agent.run(
+    "What's the weather in New York? (latitude: 40.7128, longitude: -74.0060)"
+)
+print(response)  # Agent calls get_weather() and provides the temperature
 ```
 
 ### 4. Semantic Cache for Performance Optimization
@@ -173,69 +241,68 @@ with MongoDBTools(tools_config) as tools:
 Speed up your agents and reduce LLM costs with intelligent semantic caching:
 
 ```python
-# Enable semantic cache on any MemAgent
-agent = MemAgent(
-    model=OpenAI(model="gpt-4"),
-    instruction="You are a helpful assistant.",
-    memory_provider=memory_provider,
-    semantic_cache=True,  # Enable semantic cache
-    semantic_cache_config={
-        "similarity_threshold": 0.85,  # Adjust sensitivity (0.0-1.0)
-        "max_cache_size": 1000,        # Maximum cached responses
-        "ttl_hours": 24.0              # Cache expiration time
-    }
+# Build agent without cache first
+agent = (MemAgentBuilder()
+    .with_llm_config({
+        "provider": "openai",
+        "model": "gpt-4o-mini",
+        "api_key": os.environ["OPENAI_API_KEY"]
+    })
+    .with_memory_provider(oracle_provider)
+    .build()
 )
 
-# Similar queries will use cached responses
+# Enable semantic cache (stored in Oracle)
+agent.enable_semantic_cache(
+    threshold=0.85,  # Similarity threshold (0.0-1.0)
+    scope='local'    # 'local', 'global', or 'agent'
+)
+
+# Similar queries will use cached responses from Oracle
 response1 = agent.run("What is the capital of France?")
 response2 = agent.run("Tell me France's capital city")  # Cache hit! ⚡
 response3 = agent.run("What's the capital of Japan?")   # New query, cache miss
-
-# For external frameworks - use standalone semantic cache
-from memorizz.short_term_memory.semantic_cache import StandaloneSemanticCache
-
-cache = StandaloneSemanticCache(
-    similarity_threshold=0.8,
-    embedding_provider="openai"
-)
-
-# Integrate with any agent framework
-def my_agent(query: str) -> str:
-    # Check cache first
-    cached_response = cache.query(query)
-    if cached_response:
-        return cached_response
-    
-    # Generate new response with your LLM
-    response = your_llm_call(query)
-    
-    # Cache for future similar queries
-    cache.cache_response(query, response)
-    return response
-
-# Memory-scoped caching for multi-session isolation
-from memorizz.short_term_memory.semantic_cache import create_semantic_cache
-
-user_cache = create_semantic_cache(
-    agent_id="assistant",
-    memory_id="user_session_123",  # Isolate cache per user session
-    similarity_threshold=0.9
-)
 ```
 
 **How Semantic Cache Works:**
-1. **Store queries + responses** with vector embeddings
-2. **New query arrives** → generate embedding  
-3. **Similarity search** in cache using cosine similarity
+1. **Store queries + responses** with vector embeddings in Oracle
+2. **New query arrives** → generate embedding
+3. **Similarity search** in Oracle using AI Vector Search and cosine similarity
 4. **Cache hit** (similarity ≥ threshold) → return cached response ⚡
-5. **Cache miss** → fallback to LLM + cache new response
+5. **Cache miss** → fallback to LLM + cache new response in Oracle
 
 **Benefits:**
 - 🚀 **Faster responses** for similar queries
 - 💰 **Reduced LLM costs** by avoiding duplicate API calls
 - 🎯 **Configurable precision** with similarity thresholds
 - 🔒 **Scoped isolation** by agent, memory, or session ID
-- 🔌 **Framework agnostic** - works with any agent system
+- 🗄️ **Persistent caching** in Oracle database with vector search
+
+### 5. Generate Conversation Summaries
+
+Compress long conversation histories into concise summaries:
+
+```python
+# After having several conversations with your agent
+summary_ids = agent.generate_summaries(
+    days_back=7,  # Summarize conversations from the last 7 days
+    max_memories_per_summary=50  # Memories per summary chunk
+)
+
+print(f"Generated {len(summary_ids)} summaries")
+
+# Summaries are stored in Oracle and can be retrieved
+from memorizz.common.memory_type import MemoryType
+
+summaries = oracle_provider.retrieve_by_query(
+    query={'agent_id': agent.agent_id},
+    memory_store_type=MemoryType.SUMMARIES,
+    limit=10
+)
+
+for summary in summaries:
+    print(f"Summary: {summary['content'][:200]}...")
+```
 
 ## Core Concepts
 
@@ -244,48 +311,24 @@ user_cache = create_semantic_cache(
 MemoRizz supports different memory categories for organizing information:
 
 - **CONVERSATION_MEMORY**: Chat history and dialogue context
-- **WORKFLOW_MEMORY**: Multi-step process information
+- **WORKFLOW_MEMORY**: Multi-step process information and tool execution tracking
 - **LONG_TERM_MEMORY**: Persistent knowledge storage with semantic search
 - **SHORT_TERM_MEMORY**: Temporary processing information including semantic cache for query-response optimization
 - **PERSONAS**: Agent personality and behavior definitions
-- **TOOLBOX**: Function definitions and metadata
+- **TOOLBOX**: Function definitions and metadata with semantic discovery
 - **SHARED_MEMORY**: Multi-agent coordination and communication
 - **MEMAGENT**: Agent configurations and states
 - **SUMMARIES**: Compressed summaries of past interactions for efficient memory management
 
-### Long-Term Knowledge Management
+### Oracle JSON Relational Duality Views
 
-Store and retrieve persistent knowledge with semantic search:
+MemoRizz leverages Oracle 23ai's JSON Relational Duality Views, which provide:
 
-```python
-# Add knowledge to long-term memory
-knowledge_id = agent.add_long_term_memory(
-    "I prefer Python for backend development due to its simplicity and extensive libraries.", 
-    namespace="preferences"
-)
-
-# Retrieve related knowledge
-knowledge_entries = agent.retrieve_long_term_memory(knowledge_id)
-
-# Update existing knowledge
-agent.update_long_term_memory(
-    knowledge_id, 
-    "I prefer Python for backend development and FastAPI for building APIs."
-)
-
-# Delete knowledge when no longer needed
-agent.delete_long_term_memory(knowledge_id)
-```
-
-### Tool Discovery
-
-Tools are semantically indexed, allowing natural language discovery:
-
-```python
-# Tools are automatically found based on intent
-agent.run("I need to check the weather")  # Finds and uses get_weather tool
-agent.run("Help me calculate some financial returns")  # Finds compound_interest tool
-```
+- **Dual Interface**: Access data as both relational tables and JSON documents
+- **Automatic Sync**: Changes in JSON reflect in tables and vice versa
+- **Type Safety**: Relational schema ensures data integrity
+- **Performance**: Native vector search with Oracle AI Vector Search
+- **Scalability**: Enterprise-grade database capabilities
 
 ## Advanced Usage
 
@@ -300,7 +343,7 @@ class CustomMemoryProvider(MemoryProvider):
     def store(self, data, memory_store_type):
         # Your custom storage logic
         pass
-    
+
     def retrieve_by_query(self, query, memory_store_type, limit=10):
         # Your custom retrieval logic
         pass
@@ -308,28 +351,43 @@ class CustomMemoryProvider(MemoryProvider):
 
 ### Multi-Agent Workflows
 
-Create collaborative agent systems:
+Create collaborative agent systems with shared memory in Oracle:
 
 ```python
 # Create specialized delegate agents
-data_analyst = MemAgent(
-    model=OpenAI(model="gpt-4"),
-    instruction="You are a data analysis expert.",
-    memory_provider=memory_provider
+data_analyst = (MemAgentBuilder()
+    .with_instruction("You are a data analysis expert.")
+    .with_memory_provider(oracle_provider)
+    .with_llm_config({
+        "provider": "openai",
+        "model": "gpt-4o",
+        "api_key": os.environ["OPENAI_API_KEY"]
+    })
+    .build()
 )
 
-report_writer = MemAgent(
-    model=OpenAI(model="gpt-4"), 
-    instruction="You are a report writing specialist.",
-    memory_provider=memory_provider
+report_writer = (MemAgentBuilder()
+    .with_instruction("You are a report writing specialist.")
+    .with_memory_provider(oracle_provider)
+    .with_llm_config({
+        "provider": "openai",
+        "model": "gpt-4o",
+        "api_key": os.environ["OPENAI_API_KEY"]
+    })
+    .build()
 )
 
 # Create orchestrator agent with delegates
-orchestrator = MemAgent(
-    model=OpenAI(model="gpt-4"),
-    instruction="You coordinate between specialists to complete complex tasks.",
-    memory_provider=memory_provider,
-    delegates=[data_analyst, report_writer]
+orchestrator = (MemAgentBuilder()
+    .with_instruction("You coordinate between specialists to complete complex tasks.")
+    .with_memory_provider(oracle_provider)
+    .with_delegates([data_analyst, report_writer])
+    .with_llm_config({
+        "provider": "openai",
+        "model": "gpt-4o",
+        "api_key": os.environ["OPENAI_API_KEY"]
+    })
+    .build()
 )
 
 # Execute multi-agent workflow
@@ -338,90 +396,106 @@ response = orchestrator.run("Analyze our sales data and create a quarterly repor
 
 ### Memory Management Operations
 
-Control agent memory persistence:
+Control agent memory persistence in Oracle:
 
 ```python
-# Save agent state to memory provider
+# Save agent state to Oracle
 agent.save()
 
-# Load existing agent by ID
+# Load existing agent by ID from Oracle
+from memorizz.memagent.core import MemAgent
+
 existing_agent = MemAgent.load(
     agent_id="your-agent-id",
-    memory_provider=memory_provider
+    memory_provider=oracle_provider
 )
 
-# Update agent configuration
-agent.update(
-    instruction="Updated instruction for the agent",
-    max_steps=30
-)
+# Refresh agent from Oracle database
+agent.refresh()
 
-# Delete agent and optionally cascade delete memories
-MemAgent.delete_by_id(
-    agent_id="agent-id-to-delete",
-    cascade=True,  # Deletes associated memories
-    memory_provider=memory_provider
-)
+# Start a new conversation
+agent.start_new_conversation()
+
+# Get current state
+conversation_id = agent.get_current_conversation_id()
+memory_id = agent.get_current_memory_id()
 ```
 
 ## Architecture
 
 ```
-┌─────────────────┐
-│   MemAgent      │  ← High-level agent interface
-├─────────────────┤
-│   Persona       │  ← Agent personality & behavior
-├─────────────────┤
-│   Toolbox       │  ← Function registration & discovery
-├─────────────────┤
-│ Memory Provider │  ← Storage abstraction layer
-├─────────────────┤
-│ Vector Search   │  ← Semantic similarity & retrieval
-├─────────────────┤
-│   MongoDB       │  ← Persistent storage backend
-└─────────────────┘
+┌──────────────────────┐
+│   MemAgent           │  ← High-level agent interface
+├──────────────────────┤
+│   Persona            │  ← Agent personality & behavior
+├──────────────────────┤
+│   Toolbox            │  ← Function registration & discovery
+├──────────────────────┤
+│   Memory Provider    │  ← Storage abstraction layer
+├──────────────────────┤
+│   Vector Search      │  ← Semantic similarity & retrieval
+├──────────────────────┤
+│   Oracle 23ai        │  ← Persistent storage with:
+│   - Relational Tables│     • AI Vector Search
+│   - Duality Views   │     • JSON Documents
+│   - Vector Indexes  │     • Enterprise Features
+└──────────────────────┘
 ```
 
 ## Examples
 
 Check out the `examples/` directory for complete working examples:
 
-- **memagent_single_agent.ipynb**: Basic conversational agent with memory
+- **single_agent/memagent_single_agent_demo.ipynb**: Complete single agent demo with Oracle
 - **memagents_multi_agents.ipynb**: Multi-agent collaboration workflows
 - **persona.ipynb**: Creating and using agent personas
 - **toolbox.ipynb**: Tool registration and function calling
 - **workflow.ipynb**: Workflow memory and process tracking
 - **knowledge_base.ipynb**: Long-term knowledge management
-- **semantic_cache_demo.py**: Semantic cache for performance optimization and external framework integration
+- **semantic_cache.ipynb**: Semantic cache for performance optimization
+- **memagent_summarisation.ipynb**: Conversation summarization
 
 ## Configuration
 
-### MongoDB Atlas Setup
+### Oracle Database Setup
 
-1. Create a MongoDB Atlas cluster
-2. Enable Vector Search on your cluster
-3. Create a database and collection for your agent
-4. Get your connection string
+**Connection Details (using Docker):**
+- **Host**: `localhost`
+- **Port**: `1521`
+- **Service Name**: `FREEPDB1`
+- **User**: `memorizz_user`
+- **Password**: `SecurePass123!` (change in production)
+
+**Manual Setup:**
+
+If you prefer manual setup, see the detailed guide in `examples/single_agent/memagent_single_agent_demo.ipynb`.
 
 ### Environment Variables
 
 ```bash
 # Required
 export OPENAI_API_KEY="your-openai-api-key"
-export MONGODB_URI="your-mongodb-atlas-uri"
 
-# Optional
-export MONGODB_DB_NAME="memorizz"  # Default database name
+# Oracle Connection (optional if using OracleConfig)
+export ORACLE_USER="memorizz_user"
+export ORACLE_PASSWORD="SecurePass123!"
+export ORACLE_DSN="localhost:1521/FREEPDB1"
 ```
 
 ## Troubleshooting
 
 **Common Issues:**
 
-1. **MongoDB Connection**: Ensure your IP is whitelisted in Atlas
-2. **Vector Search**: Verify vector search is enabled on your cluster
+1. **Oracle Connection**: Ensure Oracle is running and accessible
+   ```bash
+   docker ps  # Check if oracle-memorizz container is running
+   docker logs oracle-memorizz  # Check logs
+   ```
+
+2. **Vector Search**: Oracle 23ai+ is required for AI Vector Search
 3. **API Keys**: Check OpenAI API key is valid and has credits
-4. **Import Errors**: Ensure you're using the correct import paths shown in examples
+4. **Duality Views**: Ensure `setup_oracle_user.py` completed successfully
+5. **Import Errors**: Ensure you're using the correct import paths shown in examples
 
 ## Contributing
 
@@ -429,7 +503,7 @@ This is an educational project. Contributions for learning purposes are welcome:
 
 1. Fork the repository
 2. Create a feature branch
-3. Add tests for new functionality  
+3. Add tests for new functionality
 4. Submit a pull request
 
 ## License
@@ -440,6 +514,22 @@ MIT License - see LICENSE file for details.
 
 This library demonstrates key concepts in:
 - **AI Agent Architecture**: Memory, reasoning, and tool use
-- **Vector Databases**: Semantic search and retrieval
+- **Vector Databases**: Semantic search and retrieval with Oracle AI Vector Search
 - **LLM Integration**: Function calling and context management
+- **Oracle 23ai Features**: JSON Relational Duality Views and AI capabilities
 - **Software Design**: Clean abstractions and extensible architecture
+
+## Why Oracle AI Database?
+
+Oracle Database 23ai provides enterprise-grade features that make it ideal for AI agent memory:
+
+- **Native Vector Search**: Built-in AI Vector Search with multiple distance metrics
+- **JSON Duality Views**: Query data as JSON or SQL with automatic synchronization
+- **Transactional Consistency**: ACID properties for reliable memory storage
+- **Scalability**: Handle millions of memories with enterprise performance
+- **Security**: Row-level security, encryption, and comprehensive audit trails
+- **Free Tier**: Oracle Database 23ai Free for development and learning
+
+---
+
+**Ready to build memory-augmented AI agents?** Start with the [Quick Start](#quick-start) guide above or explore the [examples](examples/) directory!

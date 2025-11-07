@@ -6,4 +6,4 @@ This package contains the Ollama embedding provider implementation for local emb
 
 from .provider import OllamaEmbeddingProvider
 
-__all__ = ['OllamaEmbeddingProvider'] 
+__all__ = ["OllamaEmbeddingProvider"]

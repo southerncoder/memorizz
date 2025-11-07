@@ -1,28 +1,39 @@
-from .conversational_memory_unit import ConversationMemoryUnit
-from ..memory_provider import MemoryProvider
-from ..enums.memory_type import MemoryType
-from ..enums.application_mode import ApplicationMode, ApplicationModeConfig
-from ..embeddings import get_embedding
-from typing import TYPE_CHECKING, Dict, Any, List, Optional
-import time
-import numpy as np
-import pprint
 import logging
+import time
+from typing import Optional
+
+import numpy as np
+
+from ..embeddings import get_embedding
+from ..enums.application_mode import ApplicationModeConfig
+from ..enums.memory_type import MemoryType
 from ..llms.llm_provider import LLMProvider
+from ..memory_provider import MemoryProvider
+from .conversational_memory_unit import ConversationMemoryUnit
+
 
 # Use lazy initialization for OpenAI
 def get_openai_llm():
     from ..llms.openai import OpenAI
+
     return OpenAI()
 
+
 class MemoryUnit:
-    def __init__(self, application_mode: str, memory_provider: MemoryProvider = None, llm_provider: Optional[LLMProvider] = None):
+    def __init__(
+        self,
+        application_mode: str,
+        memory_provider: MemoryProvider = None,
+        llm_provider: Optional[LLMProvider] = None,
+    ):
         # Validate and set the application mode
         if isinstance(application_mode, str):
-            self.application_mode = ApplicationModeConfig.validate_mode(application_mode)
+            self.application_mode = ApplicationModeConfig.validate_mode(
+                application_mode
+            )
         else:
             self.application_mode = application_mode
-            
+
         self.memory_provider = memory_provider
         self.query_embedding = None
         if llm_provider:
@@ -30,7 +41,9 @@ class MemoryUnit:
         else:
             self.llm_provider = get_openai_llm()
         # Get the memory types for this application mode
-        self.active_memory_types = ApplicationModeConfig.get_memory_types(self.application_mode)
+        self.active_memory_types = ApplicationModeConfig.get_memory_types(
+            self.application_mode
+        )
 
     def generate_memory_unit(self, content: dict):
         """
@@ -42,7 +55,10 @@ class MemoryUnit:
         content["embedding"] = get_embedding(content["content"])
 
         # Determine the appropriate memory unit type based on content and active memory types
-        if MemoryType.CONVERSATION_MEMORY in self.active_memory_types and "role" in content:
+        if (
+            MemoryType.CONVERSATION_MEMORY in self.active_memory_types
+            and "role" in content
+        ):
             return self._generate_conversational_memory_unit(content)
         elif MemoryType.WORKFLOW_MEMORY in self.active_memory_types:
             return self._generate_workflow_memory_unit(content)
@@ -53,12 +69,16 @@ class MemoryUnit:
             if MemoryType.CONVERSATION_MEMORY in self.active_memory_types:
                 return self._generate_conversational_memory_unit(content)
             else:
-                raise ValueError(f"No suitable memory unit type for application mode: {self.application_mode.value}")
+                raise ValueError(
+                    f"No suitable memory unit type for application mode: {self.application_mode.value}"
+                )
 
-    def _generate_conversational_memory_unit(self, content: dict) -> ConversationMemoryUnit:
+    def _generate_conversational_memory_unit(
+        self, content: dict
+    ) -> ConversationMemoryUnit:
         """
         Generate the conversational memory unit.
-        
+
         Parameters:
             content (dict): The content of the memory unit.
 
@@ -71,7 +91,7 @@ class MemoryUnit:
             timestamp=content["timestamp"],
             conversation_id=content["conversation_id"],
             memory_id=content["memory_id"],
-            embedding=content["embedding"]
+            embedding=content["embedding"],
         )
 
         # Save the memory unit to the memory provider
@@ -82,10 +102,10 @@ class MemoryUnit:
     def _generate_workflow_memory_unit(self, content: dict):
         """
         Generate a workflow memory unit.
-        
+
         Parameters:
             content (dict): The content of the memory unit.
-            
+
         Returns:
             dict: The workflow memory unit.
         """
@@ -98,19 +118,19 @@ class MemoryUnit:
             "workflow_step": content.get("workflow_step", "unknown"),
             "task_id": content.get("task_id"),
         }
-        
+
         # Save the memory unit to the memory provider
         self._save_memory_unit(workflow_component, MemoryType.WORKFLOW_MEMORY)
-        
+
         return workflow_component
 
     def _generate_knowledge_base_unit(self, content: dict):
         """
         Generate a knowledge base (long-term memory) component.
-        
+
         Parameters:
             content (dict): The content of the memory unit.
-            
+
         Returns:
             dict: The knowledge base memory unit.
         """
@@ -123,16 +143,16 @@ class MemoryUnit:
             "category": content.get("category", "general"),
             "importance": content.get("importance", 0.5),
         }
-        
+
         # Save the memory unit to the memory provider
         self._save_memory_unit(knowledge_component, MemoryType.LONG_TERM_MEMORY)
-        
+
         return knowledge_component
-    
+
     def _save_memory_unit(self, memory_unit: any, memory_type: MemoryType = None):
         """
         Save the memory unit to the memory provider.
-        
+
         Parameters:
             memory_unit: The memory unit to save
             memory_type: Specific memory type to save to (optional)
@@ -143,9 +163,9 @@ class MemoryUnit:
             memory_unit.pop("score", None)
 
         # Convert Pydantic model to dictionary if needed
-        if hasattr(memory_unit, 'model_dump'):
+        if hasattr(memory_unit, "model_dump"):
             memory_unit_dict = memory_unit.model_dump()
-        elif hasattr(memory_unit, 'dict'):
+        elif hasattr(memory_unit, "dict"):
             memory_unit_dict = memory_unit.dict()
         else:
             # If it's already a dictionary, use it as is
@@ -157,22 +177,32 @@ class MemoryUnit:
                 memory_type = MemoryType.CONVERSATION_MEMORY
             else:
                 # Use the first available memory type from active types
-                memory_type = self.active_memory_types[0] if self.active_memory_types else MemoryType.CONVERSATION_MEMORY
+                memory_type = (
+                    self.active_memory_types[0]
+                    if self.active_memory_types
+                    else MemoryType.CONVERSATION_MEMORY
+                )
 
         # Validate that the memory type is active for this application mode
         if memory_type not in self.active_memory_types:
             logger = logging.getLogger(__name__)
-            logger.warning(f"Memory type {memory_type.value} not active for application mode {self.application_mode.value}")
+            logger.warning(
+                f"Memory type {memory_type.value} not active for application mode {self.application_mode.value}"
+            )
 
         logger = logging.getLogger(__name__)
-        
-        logger.info(f"Storing memory unit of type {memory_type.value} in memory provider")
+
+        logger.info(
+            f"Storing memory unit of type {memory_type.value} in memory provider"
+        )
         logger.debug(f"Memory component data: {memory_unit_dict}")
         stored_id = self.memory_provider.store(memory_unit_dict, memory_type)
         logger.info(f"Stored memory unit with ID: {stored_id}")
         return stored_id
 
-    def retrieve_memory_units_by_memory_id(self, memory_id: str, memory_type: MemoryType):
+    def retrieve_memory_units_by_memory_id(
+        self, memory_id: str, memory_type: MemoryType
+    ):
         """
         Retrieve the memory units by memory id.
 
@@ -184,17 +214,25 @@ class MemoryUnit:
             List[MemoryUnit]: The memory units.
         """
         if memory_type == MemoryType.CONVERSATION_MEMORY:
-            return self.memory_provider.retrieve_conversation_history_ordered_by_timestamp(memory_id)
+            return (
+                self.memory_provider.retrieve_conversation_history_ordered_by_timestamp(
+                    memory_id
+                )
+            )
 
         elif memory_type == MemoryType.WORKFLOW_MEMORY:
-            return self.memory_provider.retrieve_workflow_history_ordered_by_timestamp(memory_id)
+            return self.memory_provider.retrieve_workflow_history_ordered_by_timestamp(
+                memory_id
+            )
         else:
             raise ValueError(f"Invalid memory type: {memory_type}")
 
     def retrieve_memory_units_by_conversation_id(self, conversation_id: str):
         pass
 
-    def retrieve_memory_units_by_query(self, query: str, memory_id: str, memory_type: MemoryType, limit: int = 5):
+    def retrieve_memory_units_by_query(
+        self, query: str, memory_id: str, memory_type: MemoryType, limit: int = 5
+    ):
         """
         Retrieve the memory units by query.
 
@@ -212,7 +250,9 @@ class MemoryUnit:
         self.query_embedding = get_embedding(query)
 
         # Get the memory units by query
-        memory_units = self.memory_provider.retrieve_memory_units_by_query(query, self.query_embedding, memory_id, memory_type, limit)
+        memory_units = self.memory_provider.retrieve_memory_units_by_query(
+            query, self.query_embedding, memory_id, memory_type, limit
+        )
 
         # Get the surronding conversation ids from each of the memory units
         # Handle cases where conversation_id might be missing or _id is used instead
@@ -222,20 +262,28 @@ class MemoryUnit:
 
         # Before returning the memory units, we need to update the memory signals within the memory units
         for memory_unit in memory_units:
-            self.update_memory_signals_within_memory_unit(memory_unit, memory_type, surrounding_conversation_ids)
+            self.update_memory_signals_within_memory_unit(
+                memory_unit, memory_type, surrounding_conversation_ids
+            )
 
         # Calculate the memory signal for each of the memory units
         for memory_unit in memory_units:
-            memory_unit["memory_signal"] = self.calculate_memory_signal(memory_unit, query)
+            memory_unit["memory_signal"] = self.calculate_memory_signal(
+                memory_unit, query
+            )
 
         # Sort the memory units by the memory signal
         memory_units.sort(key=lambda x: x["memory_signal"], reverse=True)
 
         # Return the memory units
         return memory_units
-    
 
-    def update_memory_signals_within_memory_unit(self, memory_unit: any, memory_type: MemoryType, surrounding_conversation_ids: list[str]):
+    def update_memory_signals_within_memory_unit(
+        self,
+        memory_unit: any,
+        memory_type: MemoryType,
+        surrounding_conversation_ids: list[str],
+    ):
         """
         Update the memory signal within the memory unit.
 
@@ -270,7 +318,9 @@ class MemoryUnit:
         recency = time.time() - memory_unit["recall_recency"]
 
         # Get the number of associated memory ids (this is used to calcualte the importance of the memory unit)
-        number_of_associated_conversation_ids = len(memory_unit["associated_conversation_ids"])
+        number_of_associated_conversation_ids = len(
+            memory_unit["associated_conversation_ids"]
+        )
 
         # If the score exists, use it as the relevance score (this is the vector similarity score calculated by the vector search of the memory provider)
         if "score" in memory_unit:
@@ -283,7 +333,9 @@ class MemoryUnit:
         importance = self.calculate_importance(memory_unit["content"], query)
 
         # Calculate the normalized memory signal
-        memory_signal = recency * number_of_associated_conversation_ids * relevance * importance
+        memory_signal = (
+            recency * number_of_associated_conversation_ids * relevance * importance
+        )
 
         # Normalize the memory signal between 0 and 1
         memory_signal = memory_signal / 100
@@ -317,10 +369,11 @@ class MemoryUnit:
 
         # Return the relevance
         return relevance
-        
 
     # We might not need this as the memory compoennt should have a score from retrieval
-    def cosine_similarity(self, query_embedding: list[float], memory_unit_embedding: list[float]) -> float:
+    def cosine_similarity(
+        self, query_embedding: list[float], memory_unit_embedding: list[float]
+    ) -> float:
         """
         Calculate the cosine similarity between two embeddings.
 
@@ -339,11 +392,12 @@ class MemoryUnit:
         magnitude_memory_unit_embedding = np.linalg.norm(memory_unit_embedding)
 
         # Calculate the cosine similarity
-        cosine_similarity = dot_product / (magnitude_query_embedding * magnitude_memory_unit_embedding)
+        cosine_similarity = dot_product / (
+            magnitude_query_embedding * magnitude_memory_unit_embedding
+        )
 
         # Return the cosine similarity
         return cosine_similarity
-
 
     def calculate_importance(self, memory_unit_content: str, query: str) -> float:
         """
@@ -357,7 +411,6 @@ class MemoryUnit:
         Returns:
             float: The importance between 0 and 1.
         """
-   
 
         importance_prompt = f"""
         Calculate the importance of the following memory unit:
@@ -368,8 +421,10 @@ class MemoryUnit:
         """
 
         # Get the importance of the memory unit
-        importance = self.llm_provider.generate_text(importance_prompt, instructions="Return the importance of the memory unit as a number between 0 and 1. No other text or comments, just the number. For example: 0.5")
+        importance = self.llm_provider.generate_text(
+            importance_prompt,
+            instructions="Return the importance of the memory unit as a number between 0 and 1. No other text or comments, just the number. For example: 0.5",
+        )
 
         # Return the importance
         return float(importance)
-

@@ -1,9 +1,11 @@
 # src/memorizz/llms/llm_factory.py
 
-from typing import Dict, Any
+from typing import Any, Dict
+
+from .azure import AzureOpenAI
 from .llm_provider import LLMProvider
 from .openai import OpenAI
-from .azure import AzureOpenAI
+
 
 def create_llm_provider(config: Dict[str, Any]) -> LLMProvider:
     """
@@ -20,7 +22,7 @@ def create_llm_provider(config: Dict[str, Any]) -> LLMProvider:
     --------
     LLMProvider
         An instance of the specified LLM provider.
-        
+
     Raises:
     -------
     ValueError
@@ -32,7 +34,7 @@ def create_llm_provider(config: Dict[str, Any]) -> LLMProvider:
         openai_config = config.copy()
         openai_config.pop("provider", None)
         return OpenAI(**openai_config)
-        
+
     elif provider_name == "azure":
         # Create a copy of the config and remove the 'provider' key
         azure_config = config.copy()
@@ -42,10 +44,10 @@ def create_llm_provider(config: Dict[str, Any]) -> LLMProvider:
             api_version=azure_config.get("api_version"),
             deployment_name=azure_config.get("deployment_name"),
         )
-    
+
     # To extend, add more providers here:
     # elif provider_name == "anthropic":
     #     ...
-        
+
     else:
         raise ValueError(f"Unknown LLM provider: '{provider_name}'")

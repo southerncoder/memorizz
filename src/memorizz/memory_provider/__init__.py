@@ -1,9 +1,39 @@
-from .base import MemoryProvider
-from .mongodb import MongoDBProvider
 from ..enums.memory_type import MemoryType
+from .base import MemoryProvider
 
-__all__ = [
-    'MemoryProvider',
-    'MongoDBProvider',
-    'MemoryType'
-]
+
+# Lazy imports for optional dependencies
+def _lazy_import_mongodb():
+    """Lazy import MongoDB provider (requires pymongo)."""
+    try:
+        from .mongodb import MongoDBProvider
+
+        return MongoDBProvider
+    except ImportError as e:
+        raise ImportError(
+            "MongoDB provider requires pymongo. Install with: pip install pymongo"
+        ) from e
+
+
+def _lazy_import_oracle():
+    """Lazy import Oracle provider (requires oracledb)."""
+    try:
+        from .oracle import OracleProvider
+
+        return OracleProvider
+    except ImportError as e:
+        raise ImportError(
+            "Oracle provider requires oracledb. Install with: pip install oracledb"
+        ) from e
+
+
+# Make providers available via module-level getattr
+def __getattr__(name):
+    if name == "MongoDBProvider":
+        return _lazy_import_mongodb()
+    elif name == "OracleProvider":
+        return _lazy_import_oracle()
+    raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
+
+
+__all__ = ["MemoryProvider", "MongoDBProvider", "OracleProvider", "MemoryType"]

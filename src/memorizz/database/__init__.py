@@ -2,7 +2,7 @@ from .mongodb.mongodb_tools import MongoDBTools, MongoDBToolsConfig, get_mongodb
 
 __all__ = [
     # MongoDB tools
-    'MongoDBTools', 
-    'MongoDBToolsConfig', 
-    'get_mongodb_toolbox'
-] 
+    "MongoDBTools",
+    "MongoDBToolsConfig",
+    "get_mongodb_toolbox",
+]

@@ -1,3 +1,4 @@
-from .openai import OpenAI
 from .azure import AzureOpenAI
-__all__ = ['OpenAI','AzureOpenAI']
+from .openai import OpenAI
+
+__all__ = ["OpenAI", "AzureOpenAI"]
