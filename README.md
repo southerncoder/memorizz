@@ -57,36 +57,49 @@ pip install memorizz
 
 ### Oracle Database Setup
 
-**Using Docker (Recommended for getting started):**
+**📖 For complete setup instructions, see [SETUP.md](SETUP.md)**
+
+**Quick Start:**
 
 ```bash
-# Pull Oracle Database 23ai Free (with AI Vector Search)
-docker pull container-registry.oracle.com/database/free:latest
+# 1. Start Oracle Database
+./start_oracle.sh
+# For Apple Silicon: export PLATFORM_FLAG="--platform linux/amd64" && ./start_oracle.sh
 
-# Run Oracle (takes 2-3 minutes to start)
-docker run -d \
-  --name oracle-memorizz \
-  -p 1521:1521 \
-  -e ORACLE_PWD=MyPassword123! \
-  container-registry.oracle.com/database/free:latest
+# 2. Set up database schema
+# Option A: Use CLI command (recommended - works for pip-installed users)
+memorizz setup-oracle
 
-# Wait for database to be ready
-docker logs -f oracle-memorizz
-# Wait until you see: "DATABASE IS READY TO USE!"
-```
-
-**Quick Setup:**
-
-```bash
-# Clone the repository (if installing from source)
-git clone https://github.com/RichmondAlake/memorizz.git
-cd memorizz
-
-# Run the automated setup script
+# Option B: Use examples script (repo-cloned users only)
+# Note: CLI command (Option A) is recommended for most users
 python examples/setup_oracle_user.py
+
+# The setup automatically detects your database type:
+# - Admin mode: Full setup with user creation (local/self-hosted)
+# - User-only mode: Uses existing schema (hosted databases like FreeSQL.com)
+
+# 3. Configure credentials (Option A: .env file - recommended)
+cp .env.example .env
+# Edit .env with your credentials
+
+# Or Option B: Environment variables
+export OPENAI_API_KEY="your-openai-api-key"
+export ORACLE_USER="memorizz_user"
+export ORACLE_PASSWORD="SecurePass123!"
+export ORACLE_DSN="localhost:1521/FREEPDB1"
 ```
 
-This script will:
+**Default Credentials:**
+- Admin User: `system`
+- Admin Password: `MyPassword123!` (configurable via `ORACLE_ADMIN_PASSWORD`)
+- MemoRizz User: `memorizz_user`
+- MemoRizz Password: `SecurePass123!` (configurable via `ORACLE_PASSWORD`)
+
+**Customizing Credentials:**
+
+All credentials can be customized using environment variables. See [SETUP.md](SETUP.md) for details.
+
+The setup script will:
 - Create the `memorizz_user` with all required privileges
 - Set up the relational schema (tables + indexes)
 - Create JSON Relational Duality Views
@@ -459,16 +472,30 @@ Check out the `examples/` directory for complete working examples:
 
 ### Oracle Database Setup
 
-**Connection Details (using Docker):**
+**📖 For complete configuration details, see [SETUP.md](SETUP.md)**
+
+**Connection Details (using Docker with defaults):**
 - **Host**: `localhost`
 - **Port**: `1521`
 - **Service Name**: `FREEPDB1`
 - **User**: `memorizz_user`
-- **Password**: `SecurePass123!` (change in production)
+- **Password**: `SecurePass123!` (configurable via `ORACLE_PASSWORD`)
 
-**Manual Setup:**
+**Hosted Databases (FreeSQL.com, Oracle Cloud, etc.):**
+- The setup automatically detects hosted databases and uses user-only mode
+- Simply set `ORACLE_USER`, `ORACLE_PASSWORD`, and `ORACLE_DSN` environment variables
+- No admin credentials needed - uses your existing schema
 
-If you prefer manual setup, see the detailed guide in `examples/single_agent/memagent_single_agent_demo.ipynb`.
+**Environment Variables:**
+
+All Oracle credentials can be configured via environment variables:
+- `ORACLE_ADMIN_USER` - Admin username (default: `system`)
+- `ORACLE_ADMIN_PASSWORD` - Admin password (default: `MyPassword123!`)
+- `ORACLE_USER` - MemoRizz user (default: `memorizz_user`)
+- `ORACLE_PASSWORD` - MemoRizz password (default: `SecurePass123!`)
+- `ORACLE_DSN` - Connection string (default: `localhost:1521/FREEPDB1`)
+
+See [SETUP.md](SETUP.md) for detailed configuration options and manual setup instructions.
 
 ### Environment Variables
 

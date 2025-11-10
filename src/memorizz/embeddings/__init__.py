@@ -250,4 +250,130 @@ def get_embedding_dimensions(model: Optional[str] = None) -> int:
     int
         The number of dimensions in the embedding vector
     """
-    return get_embedding_manager().get_dimensions()
+    dimensions = get_embedding_manager().get_dimensions()
+    provider_info = get_embedding_manager().get_provider_info()
+    logger.debug(
+        f"Inferred embedding dimensions: {dimensions} "
+        f"(provider: {provider_info['provider']}, model: {provider_info['model']})"
+    )
+    return dimensions
+
+
+def infer_embedding_dimensions(
+    provider: Union[str, EmbeddingProvider],
+    model: str,
+    config: Optional[Dict[str, Any]] = None,
+) -> int:
+    """
+    Infer embedding dimensions for a given provider and model without instantiating.
+    This is useful for schema creation and validation.
+
+    Parameters:
+    -----------
+    provider : Union[str, EmbeddingProvider]
+        The embedding provider name or enum
+    model : str
+        The model name
+    config : Optional[Dict[str, Any]]
+        Optional configuration (e.g., dimensions override for OpenAI)
+
+    Returns:
+    --------
+    int
+        The inferred number of dimensions
+
+    Examples:
+    --------
+    >>> infer_embedding_dimensions("openai", "text-embedding-3-small")
+    1536
+    >>> infer_embedding_dimensions("openai", "text-embedding-3-small", {"dimensions": 512})
+    512
+    >>> infer_embedding_dimensions("ollama", "nomic-embed-text")
+    768
+    """
+    provider_str = (
+        provider.value if isinstance(provider, EmbeddingProvider) else provider
+    )
+
+    # OpenAI provider
+    if provider_str in ["openai", "azure"]:
+        from .openai.provider import OpenAIEmbeddingProvider
+
+        # Check if dimensions are explicitly set in config
+        if config and "dimensions" in config:
+            dimensions = config["dimensions"]
+            logger.debug(
+                f"Inferred dimensions from config: {dimensions} "
+                f"(provider: {provider_str}, model: {model})"
+            )
+            return dimensions
+
+        # Use model's default/max dimensions
+        max_dims = OpenAIEmbeddingProvider.MODEL_DIMENSIONS.get(model)
+        if max_dims:
+            # For OpenAI 3-small/3-large, default to max unless specified
+            dimensions = config.get("dimensions", max_dims) if config else max_dims
+            logger.debug(
+                f"Inferred dimensions from model: {dimensions} "
+                f"(provider: {provider_str}, model: {model})"
+            )
+            return dimensions
+        else:
+            # Fallback for unknown models
+            logger.warning(
+                f"Unknown OpenAI model {model}, defaulting to 1536 dimensions"
+            )
+            return 1536
+
+    # Ollama provider
+    elif provider_str == "ollama":
+        from .ollama.provider import OllamaEmbeddingProvider
+
+        dimensions = OllamaEmbeddingProvider.MODEL_DIMENSIONS.get(model, 768)
+        logger.debug(
+            f"Inferred dimensions from model: {dimensions} "
+            f"(provider: {provider_str}, model: {model})"
+        )
+        return dimensions
+
+    # VoyageAI provider
+    elif provider_str == "voyageai":
+        from .voyageai.provider import VoyageAIEmbeddingProvider
+
+        # VoyageAI models have configurable dimensions
+        if config and "output_dimension" in config:
+            dimensions = config["output_dimension"]
+            logger.debug(
+                f"Inferred dimensions from config: {dimensions} "
+                f"(provider: {provider_str}, model: {model})"
+            )
+            return dimensions
+
+        # Use model's default dimensions
+        text_models = VoyageAIEmbeddingProvider.TEXT_MODELS
+        if model in text_models:
+            dimensions = text_models[model]["default_dimensions"]
+            logger.debug(
+                f"Inferred dimensions from model: {dimensions} "
+                f"(provider: {provider_str}, model: {model})"
+            )
+            return dimensions
+        else:
+            logger.warning(
+                f"Unknown VoyageAI model {model}, defaulting to 1024 dimensions"
+            )
+            return 1024
+
+    # Unknown provider - try to get from global config or raise
+    else:
+        logger.warning(
+            f"Unknown provider {provider_str}, attempting to infer from global config"
+        )
+        try:
+            return get_embedding_dimensions()
+        except Exception as e:
+            logger.error(f"Could not infer dimensions: {e}")
+            raise ValueError(
+                f"Cannot infer dimensions for provider '{provider_str}' and model '{model}'. "
+                "Please specify dimensions explicitly in config."
+            )
