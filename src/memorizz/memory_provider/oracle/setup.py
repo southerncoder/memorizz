@@ -11,6 +11,7 @@ Supports two modes:
 
 import os
 import sys
+import time
 from pathlib import Path
 from typing import Dict, Optional, Tuple
 
@@ -46,6 +47,96 @@ def parse_sql_file(filepath):
     statements = [s for s in statements if not s.upper().startswith("COMMENT")]
 
     return statements
+
+
+def _escape_sql_literal(value: str) -> str:
+    """Escape single quotes in SQL string literals."""
+    return value.replace("'", "''") if value is not None else value
+
+
+def _join_server_path(directory: str, filename: str) -> str:
+    """
+    Join paths using the separator that matches the server directory style.
+
+    Oracle may run on Linux (/) or Windows (\\). We inspect the directory string
+    and use the same separator to avoid generating invalid paths.
+    """
+    if not directory:
+        return filename
+
+    directory = directory.rstrip("/\\")
+    if "\\" in directory and "/" not in directory:
+        separator = "\\"
+    else:
+        separator = "/"
+    return f"{directory}{separator}{filename}"
+
+
+def _extract_directory_from_path(file_path: str) -> Optional[str]:
+    """Return the directory portion of an Oracle datafile path."""
+    if not file_path:
+        return None
+    for sep in ("/", "\\"):
+        if sep in file_path:
+            return file_path.rsplit(sep, 1)[0]
+    return None
+
+
+def _determine_datafile_path(
+    admin_cursor, tablespace_name: str
+) -> Tuple[Optional[str], Optional[str]]:
+    """
+    Determine a datafile path for a new tablespace.
+
+    Returns (path, source_description). Path may be None if Oracle Managed Files
+    should handle file placement.
+    """
+    env_file = os.environ.get("ORACLE_TABLESPACE_DATAFILE")
+    if env_file:
+        return env_file, "environment datafile override"
+
+    env_dir = os.environ.get("ORACLE_DATAFILE_DIR")
+    if env_dir:
+        path = _join_server_path(env_dir, f"{tablespace_name.lower()}_01.dbf")
+        return path, "environment datafile directory"
+
+    # Try Oracle Managed Files destination (db_create_file_dest)
+    try:
+        admin_cursor.execute(
+            "SELECT value FROM v$parameter WHERE name = 'db_create_file_dest'"
+        )
+        row = admin_cursor.fetchone()
+        if row and row[0]:
+            base_dir = row[0].strip()
+            if base_dir:
+                path = _join_server_path(base_dir, f"{tablespace_name.lower()}_01.dbf")
+                return path, "db_create_file_dest parameter"
+    except Exception:
+        pass
+
+    # Fall back to reusing the directory of an existing user tablespace
+    try:
+        admin_cursor.execute(
+            """
+            SELECT file_name FROM (
+                SELECT file_name
+                FROM dba_data_files
+                WHERE tablespace_name NOT IN ('SYSTEM', 'SYSAUX')
+                ORDER BY file_id
+            )
+            WHERE ROWNUM = 1
+        """
+        )
+        row = admin_cursor.fetchone()
+        if row and row[0]:
+            directory = _extract_directory_from_path(row[0])
+            if directory:
+                path = _join_server_path(directory, f"{tablespace_name.lower()}_01.dbf")
+                return path, "existing datafile directory"
+    except Exception:
+        pass
+
+    return None, None
 
 
 def _can_create_users(conn) -> bool:
@@ -90,7 +181,6 @@ def _check_user_privileges(conn) -> Dict[str, bool]:
     privileges = {
         "CREATE_TABLE": False,
         "CREATE_VIEW": False,
-        "CREATE_INDEX": False,
         "CREATE_SEQUENCE": False,
         "CREATE_TRIGGER": False,
         "DBMS_VECTOR": False,
@@ -99,10 +189,11 @@ def _check_user_privileges(conn) -> Dict[str, bool]:
 
     try:
         # Check system privileges
+        # Note: CREATE INDEX is not a separate privilege - it's included with CREATE TABLE
         cursor.execute(
             """
             SELECT privilege FROM user_sys_privs
-            WHERE privilege IN ('CREATE TABLE', 'CREATE VIEW', 'CREATE INDEX',
+            WHERE privilege IN ('CREATE TABLE', 'CREATE VIEW',
                                'CREATE SEQUENCE', 'CREATE TRIGGER')
         """
         )
@@ -110,7 +201,6 @@ def _check_user_privileges(conn) -> Dict[str, bool]:
 
         privileges["CREATE_TABLE"] = "CREATE TABLE" in sys_privs
         privileges["CREATE_VIEW"] = "CREATE VIEW" in sys_privs
-        privileges["CREATE_INDEX"] = "CREATE INDEX" in sys_privs
         privileges["CREATE_SEQUENCE"] = "CREATE SEQUENCE" in sys_privs
         privileges["CREATE_TRIGGER"] = "CREATE TRIGGER" in sys_privs
 
@@ -143,9 +233,79 @@ def _check_user_privileges(conn) -> Dict[str, bool]:
     return privileges
 
 
+def _is_connection_refused_error(error: Exception) -> bool:
+    """
+    Check if an error is a "Connection refused" error.
+
+    Args:
+        error: Exception object to check
+
+    Returns:
+        True if this is a connection refused error, False otherwise
+    """
+    error_str = str(error)
+    error_repr = repr(error)
+
+    # Check for common connection refused indicators
+    connection_refused_indicators = [
+        "Connection refused",
+        "Errno 61",
+        "[Errno 61]",
+        "cannot connect to database",
+        "DPY-6005",  # Oracle Python driver error code for connection issues
+    ]
+
+    return any(
+        indicator in error_str or indicator in error_repr
+        for indicator in connection_refused_indicators
+    )
+
+
+def _print_connection_refused_help(dsn: str):
+    """
+    Print helpful guidance when connection is refused.
+
+    Args:
+        dsn: Database connection string (to check if it's localhost)
+    """
+    is_localhost = "localhost" in dsn or "127.0.0.1" in dsn
+
+    print("\n🔍 Connection Refused - Database Not Reachable")
+    print("-" * 70)
+
+    if is_localhost:
+        print("The database at localhost is not reachable. This usually means:")
+        print()
+        print("  1. Docker is not running")
+        print("     → Check: docker ps")
+        print("     → Start Docker Desktop if needed")
+        print()
+        print("  2. Oracle container is not running")
+        print("     → Check: docker ps -a | grep oracle")
+        print("     → Start container: docker start oracle-memorizz")
+        print("     → Or create new: ./install_oracle.sh")
+        print()
+        print("  3. Database is still starting up")
+        print("     → Check logs: docker logs -f oracle-memorizz")
+        print("     → Wait for: 'DATABASE IS READY TO USE!'")
+        print()
+        print("Quick fix:")
+        print("  ./install_oracle.sh")
+        print("  # Then wait for database to be ready before running setup again")
+    else:
+        print("The database at the specified DSN is not reachable. Please check:")
+        print()
+        print("  1. Database host is correct and accessible")
+        print("  2. Network connectivity to the database server")
+        print("  3. Firewall rules allow connections on port 1521")
+        print("  4. Database service is running on the remote server")
+        print()
+        print(f"  DSN: {dsn}")
+
+
 def _check_admin_capabilities(
-    admin_user: str, admin_password: str, dsn: str
-) -> Tuple[bool, Optional[object], Dict[str, bool]]:
+    admin_user: str, admin_password: str, dsn: str, mode=None
+) -> Tuple[bool, Optional[object], Dict[str, bool], Optional[str]]:
     """
     Check if admin connection is possible and what capabilities are available.
 
@@ -153,25 +313,38 @@ def _check_admin_capabilities(
         admin_user: Admin username
         admin_password: Admin password
         dsn: Database connection string
+        mode: Connection mode (e.g., oracledb.SYSDBA for SYS as SYSDBA)
 
     Returns:
-        Tuple of (can_connect, connection_object, capabilities_dict)
-        If connection fails, returns (False, None, {})
+        Tuple of (can_connect, connection_object, capabilities_dict, error_message)
+        If connection fails, returns (False, None, {}, error_message)
     """
     try:
-        admin_conn = oracledb.connect(user=admin_user, password=admin_password, dsn=dsn)
+        if mode is not None:
+            admin_conn = oracledb.connect(
+                user=admin_user, password=admin_password, dsn=dsn, mode=mode
+            )
+        else:
+            admin_conn = oracledb.connect(
+                user=admin_user, password=admin_password, dsn=dsn
+            )
         can_create = _can_create_users(admin_conn)
         capabilities = {
             "can_create_users": can_create,
             "can_grant_privileges": can_create,  # Assumed if can create users
         }
-        return True, admin_conn, capabilities
-    except Exception:
-        return False, None, {}
+        return True, admin_conn, capabilities, None
+    except Exception as e:
+        error_msg = str(e)
+        return False, None, {}, error_msg
 
 
 def _create_user_and_grant_privileges(
-    admin_conn, memorizz_user: str, memorizz_password: str, dsn: str
+    admin_conn,
+    memorizz_user: str,
+    memorizz_password: str,
+    dsn: str,
+    admin_user: str = None,
 ) -> bool:
     """
     Create user and grant all required privileges (Admin mode only).
@@ -222,33 +395,156 @@ def _create_user_and_grant_privileges(
                     print("  Reconnecting to database...")
                     admin_cursor.close()
                     admin_conn.close()
-                    admin_conn = oracledb.connect(
-                        user=os.environ.get("ORACLE_ADMIN_USER", "system"),
-                        password=os.environ.get(
-                            "ORACLE_ADMIN_PASSWORD", "MyPassword123!"
-                        ),
-                        dsn=dsn,
+                    # Reconnect with proper admin user (could be sys as sysdba)
+                    reconnect_admin_user = admin_user or os.environ.get(
+                        "ORACLE_ADMIN_USER", "system"
                     )
+                    admin_password = os.environ.get(
+                        "ORACLE_ADMIN_PASSWORD", "MyPassword123!"
+                    )
+                    # Try to reconnect as sys if we were using sys
+                    if reconnect_admin_user.lower() == "sys":
+                        admin_conn = oracledb.connect(
+                            user="sys",
+                            password=admin_password,
+                            dsn=dsn,
+                            mode=oracledb.SYSDBA,
+                        )
+                    else:
+                        admin_conn = oracledb.connect(
+                            user=reconnect_admin_user,
+                            password=admin_password,
+                            dsn=dsn,
+                        )
                     admin_cursor = admin_conn.cursor()
                     print("  ✓ Reconnected successfully")
+
+                # Wait a moment for sessions to fully terminate
+                print("  Waiting for sessions to terminate...")
+                time.sleep(2)
+
+                # Check again for remaining sessions
+                admin_cursor.execute(
+                    f"""
+                    SELECT sid, serial# FROM v$session WHERE username = UPPER('{memorizz_user}')
+                """
+                )
+                remaining_sessions = admin_cursor.fetchall()
+                if remaining_sessions:
+                    print(
+                        f"  ⚠ {len(remaining_sessions)} session(s) still active, forcing termination..."
+                    )
+                    for sid, serial in remaining_sessions:
+                        try:
+                            admin_cursor.execute(
+                                f"ALTER SYSTEM DISCONNECT SESSION '{sid},{serial}' IMMEDIATE"
+                            )
+                            print(f"    ✓ Disconnected session {sid},{serial}")
+                        except Exception as e:
+                            print(
+                                f"    ⚠ Could not disconnect session {sid},{serial}: {e}"
+                            )
+                    time.sleep(1)
             else:
                 print("  No active sessions found")
 
-            # Now drop the user
-            admin_cursor.execute(f"DROP USER {memorizz_user} CASCADE")
-            print(f"  ✓ Dropped existing {memorizz_user} user")
+            # Now drop the user (with retry)
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    admin_cursor.execute(f"DROP USER {memorizz_user} CASCADE")
+                    print(f"  ✓ Dropped existing {memorizz_user} user")
+                    break
+                except Exception as e:
+                    error_str = str(e)
+                    if "ORA-01918" in error_str:
+                        print("  ℹ User doesn't exist yet (this is fine)")
+                        break
+                    elif "ORA-01940" in error_str and attempt < max_retries - 1:
+                        print(
+                            f"  ⚠ User still has active connections, waiting and retrying ({attempt + 1}/{max_retries})..."
+                        )
+                        time.sleep(2)
+                        # Try to disconnect any remaining sessions
+                        try:
+                            admin_cursor.execute(
+                                f"""
+                                SELECT sid, serial# FROM v$session WHERE username = UPPER('{memorizz_user}')
+                            """
+                            )
+                            remaining = admin_cursor.fetchall()
+                            for sid, serial in remaining:
+                                try:
+                                    admin_cursor.execute(
+                                        f"ALTER SYSTEM DISCONNECT SESSION '{sid},{serial}' IMMEDIATE"
+                                    )
+                                except Exception:
+                                    pass
+                            time.sleep(1)
+                        except Exception:
+                            pass
+                    else:
+                        print(f"  ⚠ Could not drop user: {e}")
+                        # Check if user exists - if it does and we can't drop it, we'll try to continue
+                        try:
+                            admin_cursor.execute(
+                                f"SELECT username FROM all_users WHERE username = UPPER('{memorizz_user}')"
+                            )
+                            user_exists = admin_cursor.fetchone()
+                            if user_exists:
+                                print(
+                                    f"  ℹ User {memorizz_user} exists but couldn't be dropped - will try to continue"
+                                )
+                        except Exception:
+                            pass
+                        break
         except Exception as e:
             if "ORA-01918" in str(e):
                 print("  ℹ User doesn't exist yet (this is fine)")
             else:
-                print(f"  ⚠ {e}")
+                print(f"  ⚠ Error during user drop: {e}")
 
-        # Create user
+        # Create user (check if it already exists first)
         print(f"\nCreating {memorizz_user} user...")
-        admin_cursor.execute(
-            f'CREATE USER {memorizz_user} IDENTIFIED BY "{memorizz_password}"'
-        )
-        print(f"  ✓ User {memorizz_user} created")
+        try:
+            # Check if user already exists
+            admin_cursor.execute(
+                f"SELECT username FROM all_users WHERE username = UPPER('{memorizz_user}')"
+            )
+            user_exists = admin_cursor.fetchone()
+
+            if user_exists:
+                print(f"  ℹ User {memorizz_user} already exists")
+                # Try to alter password in case it changed
+                try:
+                    admin_cursor.execute(
+                        f'ALTER USER {memorizz_user} IDENTIFIED BY "{memorizz_password}"'
+                    )
+                    print(f"  ✓ Updated password for existing user {memorizz_user}")
+                except Exception as e:
+                    print(f"  ⚠ Could not update password: {e}")
+            else:
+                admin_cursor.execute(
+                    f'CREATE USER {memorizz_user} IDENTIFIED BY "{memorizz_password}"'
+                )
+                print(f"  ✓ User {memorizz_user} created")
+        except Exception as e:
+            error_str = str(e)
+            if "ORA-01920" in error_str:
+                print(
+                    f"  ℹ User {memorizz_user} already exists (name conflict resolved)"
+                )
+                # Try to alter password
+                try:
+                    admin_cursor.execute(
+                        f'ALTER USER {memorizz_user} IDENTIFIED BY "{memorizz_password}"'
+                    )
+                    print(f"  ✓ Updated password for existing user {memorizz_user}")
+                except Exception as alter_e:
+                    print(f"  ⚠ Could not update password: {alter_e}")
+            else:
+                print(f"  ✗ Failed to create user: {e}")
+                raise
 
         # Grant basic privileges (least-privilege principle)
         print("\nGranting basic privileges (least-privilege)...")
@@ -256,10 +552,7 @@ def _create_user_and_grant_privileges(
         print("  ✓ CREATE SESSION (required for database connections)")
 
         admin_cursor.execute(f"GRANT CREATE TABLE TO {memorizz_user}")
-        print("  ✓ CREATE TABLE (required for memory storage tables)")
-
-        admin_cursor.execute(f"GRANT CREATE INDEX TO {memorizz_user}")
-        print("  ✓ CREATE INDEX (required for vector indexes)")
+        print("  ✓ CREATE TABLE (required for memory storage tables and indexes)")
 
         admin_cursor.execute(f"GRANT CREATE VIEW TO {memorizz_user}")
         print("  ✓ CREATE VIEW (required for JSON Duality Views)")
@@ -272,6 +565,165 @@ def _create_user_and_grant_privileges(
 
         admin_cursor.execute(f"GRANT UNLIMITED TABLESPACE TO {memorizz_user}")
         print("  ✓ UNLIMITED TABLESPACE (required for data storage)")
+
+        # Set default tablespace for VECTOR support (required for Oracle 23ai VECTOR types)
+        # VECTOR types require automatic segment space management tablespace
+        print("\nSetting default tablespace for VECTOR support...")
+        try:
+            env_tablespace = os.environ.get("ORACLE_TABLESPACE_NAME")
+            preferred_tablespaces = []
+            if env_tablespace:
+                preferred_tablespaces.append(env_tablespace.upper())
+            if "USERS" not in preferred_tablespaces:
+                preferred_tablespaces.append("USERS")
+
+            def _set_default_tablespace(ts_name: str) -> bool:
+                admin_cursor.execute(
+                    f"ALTER USER {memorizz_user} DEFAULT TABLESPACE {ts_name}"
+                )
+                admin_cursor.execute(
+                    f"""
+                    SELECT default_tablespace FROM dba_users
+                    WHERE username = UPPER('{memorizz_user}')
+                """
+                )
+                result = admin_cursor.fetchone()
+                return bool(result and result[0] == ts_name.upper())
+
+            default_tablespace_set = False
+
+            for candidate in preferred_tablespaces:
+                try:
+                    if _set_default_tablespace(candidate):
+                        print(
+                            f"  ✓ Set default tablespace to {candidate} (supports VECTOR types)"
+                        )
+                        default_tablespace_set = True
+                        break
+                except Exception as candidate_error:
+                    print(
+                        f"  ⚠ Could not set {candidate} tablespace: {candidate_error}"
+                    )
+
+            if not default_tablespace_set:
+                # Find any AUTO tablespace
+                admin_cursor.execute(
+                    """
+                    SELECT tablespace_name FROM dba_tablespaces
+                    WHERE segment_space_management = 'AUTO'
+                    AND tablespace_name NOT IN ('SYSTEM', 'SYSAUX')
+                    AND status = 'ONLINE'
+                    ORDER BY tablespace_name
+                """
+                )
+                auto_tablespace = admin_cursor.fetchone()
+                if auto_tablespace:
+                    ts_name = auto_tablespace[0]
+                    try:
+                        if _set_default_tablespace(ts_name):
+                            print(
+                                f"  ✓ Set default tablespace to {ts_name} (supports VECTOR types)"
+                            )
+                            default_tablespace_set = True
+                    except Exception as auto_error:
+                        print(
+                            f"  ⚠ Could not set auto tablespace {ts_name}: {auto_error}"
+                        )
+
+            if not default_tablespace_set:
+                # No suitable tablespace found, create one with explicit datafile path
+                tablespace_name = (
+                    env_tablespace.upper()
+                    if env_tablespace
+                    else f"{memorizz_user.upper()}_TS"
+                )
+
+                size_env = os.environ.get("ORACLE_TABLESPACE_SIZE_MB")
+                autoextend_env = os.environ.get("ORACLE_TABLESPACE_AUTOEXTEND_MB")
+                try:
+                    tablespace_size_mb = (
+                        max(int(size_env), 1) if size_env is not None else 100
+                    )
+                except ValueError:
+                    print(
+                        f"  ⚠ Invalid ORACLE_TABLESPACE_SIZE_MB='{size_env}', defaulting to 100"
+                    )
+                    tablespace_size_mb = 100
+
+                try:
+                    autoextend_mb = (
+                        max(int(autoextend_env), 1)
+                        if autoextend_env is not None
+                        else 10
+                    )
+                except ValueError:
+                    print(
+                        f"  ⚠ Invalid ORACLE_TABLESPACE_AUTOEXTEND_MB='{autoextend_env}', defaulting to 10"
+                    )
+                    autoextend_mb = 10
+
+                datafile_path, datafile_source = _determine_datafile_path(
+                    admin_cursor, tablespace_name
+                )
+                if datafile_path:
+                    escaped_path = _escape_sql_literal(datafile_path)
+                    datafile_clause = (
+                        f"DATAFILE '{escaped_path}' SIZE {tablespace_size_mb}M"
+                    )
+                    print(
+                        f"  ℹ Using datafile path '{datafile_path}' ({datafile_source})"
+                    )
+                else:
+                    datafile_clause = f"DATAFILE SIZE {tablespace_size_mb}M"
+                    print(
+                        "  ℹ No datafile directory detected; relying on Oracle Managed Files configuration"
+                    )
+
+                try:
+                    create_sql = f"""
+                        CREATE TABLESPACE {tablespace_name}
+                        {datafile_clause}
+                        AUTOEXTEND ON NEXT {autoextend_mb}M MAXSIZE UNLIMITED
+                        SEGMENT SPACE MANAGEMENT AUTO
+                    """
+                    admin_cursor.execute(create_sql)
+                    if _set_default_tablespace(tablespace_name):
+                        print(
+                            f"  ✓ Created and set default tablespace {tablespace_name} (supports VECTOR types)"
+                        )
+                        default_tablespace_set = True
+                except Exception as create_error:
+                    error_str2 = str(create_error)
+                    if (
+                        "ORA-01543" in error_str2
+                        or "already exists" in error_str2.lower()
+                    ):
+                        try:
+                            if _set_default_tablespace(tablespace_name):
+                                print(
+                                    f"  ✓ Set default tablespace to existing {tablespace_name} (supports VECTOR types)"
+                                )
+                                default_tablespace_set = True
+                        except Exception as alter_error:
+                            print(
+                                f"  ⚠ Tablespace {tablespace_name} exists but could not be assigned: {alter_error}"
+                            )
+                    else:
+                        print(f"  ⚠ Could not create tablespace: {create_error}")
+                        print(
+                            "    VECTOR types may not work - continuing anyway. See SETUP.md for manual tablespace steps."
+                        )
+
+            if not default_tablespace_set:
+                print("  ⚠ Default tablespace could not be configured automatically")
+                print(
+                    "    VECTOR types may not work - user may need manual tablespace setup"
+                )
+        except Exception as e:
+            print(f"  ⚠ Could not configure tablespace: {e}")
+            print(
+                "    VECTOR types may not work - user may need manual tablespace setup"
+            )
 
         # Grant AI Vector Search privileges (Oracle 23ai+)
         print("\nGranting AI Vector Search privileges...")
@@ -496,10 +948,51 @@ def setup_oracle_user():
     print("Detecting setup mode...")
     print("-" * 70)
 
-    # Try to connect as admin first
-    can_connect_admin, admin_conn, admin_capabilities = _check_admin_capabilities(
-        ADMIN_USER, ADMIN_PASSWORD, DSN
-    )
+    # Try to connect as admin first (SYSTEM)
+    (
+        can_connect_admin,
+        admin_conn,
+        admin_capabilities,
+        admin_error,
+    ) = _check_admin_capabilities(ADMIN_USER, ADMIN_PASSWORD, DSN)
+
+    # Track which admin user we're using (for display purposes)
+    active_admin_user = ADMIN_USER
+
+    # If SYSTEM can connect but can't create users, try SYS as SYSDBA
+    if can_connect_admin and not admin_capabilities.get("can_create_users", False):
+        print(f"  Admin user '{ADMIN_USER}' cannot create users")
+        print(f"  Trying SYS as SYSDBA (has full privileges)...")
+
+        # Try SYS as SYSDBA (SYS password is same as SYSTEM in Oracle Free)
+        try:
+            # Check if SYSDBA mode is available
+            if not hasattr(oracledb, "SYSDBA"):
+                print(
+                    f"  ⚠ oracledb.SYSDBA not available (may need newer oracledb version)"
+                )
+                raise AttributeError("SYSDBA not available")
+
+            sys_mode = oracledb.SYSDBA
+            (
+                can_connect_sys,
+                sys_conn,
+                sys_capabilities,
+                sys_error,
+            ) = _check_admin_capabilities("sys", ADMIN_PASSWORD, DSN, mode=sys_mode)
+
+            if can_connect_sys and sys_capabilities.get("can_create_users", False):
+                # Close SYSTEM connection and use SYS
+                if admin_conn:
+                    admin_conn.close()
+                admin_conn = sys_conn
+                admin_capabilities = sys_capabilities
+                active_admin_user = "sys"  # Update for display
+                print(f"  ✓ Connected as SYS as SYSDBA (has CREATE USER privilege)")
+            else:
+                print(f"  ⚠ SYS as SYSDBA connection failed or cannot create users")
+        except Exception as e:
+            print(f"  ⚠ Could not try SYS as SYSDBA: {e}")
 
     setup_mode = None
     user_conn = None
@@ -508,7 +1001,7 @@ def setup_oracle_user():
         # Admin mode: Full setup possible
         setup_mode = "admin"
         print("✓ Admin mode detected: Full setup with user creation")
-        print(f"  Connected as: {ADMIN_USER}")
+        print(f"  Connected as: {active_admin_user}")
         print(f"  Can create users: Yes")
     else:
         # User-only mode: Use existing schema
@@ -516,8 +1009,38 @@ def setup_oracle_user():
         print("ℹ User-only mode detected: Using existing schema")
         if not can_connect_admin:
             print(f"  Admin connection failed (this is OK for hosted databases)")
+            if admin_error:
+                # Check if it's a credential error (likely local setup issue)
+                if (
+                    "ORA-01017" in admin_error
+                    or "invalid credential" in admin_error.lower()
+                ):
+                    print(f"\n  ⚠ Admin credential error: {admin_error}")
+                    print(f"  This suggests the admin password may be incorrect.")
+                    print(f"  For local Docker setup:")
+                    print(
+                        f"    1. If you used install_oracle.sh, run: eval $(./install_oracle.sh)"
+                    )
+                    print(f"       This sets ORACLE_ADMIN_PASSWORD automatically")
+                    print(
+                        f'    2. Or set manually: export ORACLE_ADMIN_PASSWORD="MyPassword123!"'
+                    )
+                    print(
+                        f"    3. Ensure the password matches what was used in install_oracle.sh"
+                    )
+                    print(
+                        f"  Current admin password: {'*' * len(ADMIN_PASSWORD) if ADMIN_PASSWORD else '(not set, using default)'}"
+                    )
+                    print(f"  Expected default: MyPassword123!")
+                elif _is_connection_refused_error(Exception(admin_error)):
+                    # Connection refused - already handled by _print_connection_refused_help
+                    pass
+                else:
+                    print(f"  Error details: {admin_error}")
         else:
-            print(f"  Admin user '{ADMIN_USER}' cannot create users")
+            print(
+                f"  Admin user '{active_admin_user}' cannot create users (tried SYSTEM and SYS)"
+            )
         print(f"  Will use existing user: {MEMORIZZ_USER}")
 
         # Try to connect as the regular user
@@ -541,10 +1064,19 @@ def setup_oracle_user():
                 print("    Some features may not be available")
         except Exception as e:
             print(f"  ✗ Failed to connect as {MEMORIZZ_USER}: {e}")
-            print("\nPlease check:")
-            print("  1. ORACLE_USER environment variable is set correctly")
-            print("  2. ORACLE_PASSWORD environment variable is set correctly")
-            print("  3. ORACLE_DSN environment variable is set correctly")
+
+            # Check if this is a connection refused error
+            if _is_connection_refused_error(e):
+                _print_connection_refused_help(DSN)
+            else:
+                # For other errors, show credential/configuration guidance
+                print("\nPlease check:")
+                print("  1. ORACLE_USER environment variable is set correctly")
+                print("  2. ORACLE_PASSWORD environment variable is set correctly")
+                print("  3. ORACLE_DSN environment variable is set correctly")
+                print("  4. User credentials are valid for the database")
+                print("  5. Database service is running and accessible")
+
             if admin_conn:
                 admin_conn.close()
             return False
@@ -557,7 +1089,7 @@ def setup_oracle_user():
         print("-" * 70)
 
         success = _create_user_and_grant_privileges(
-            admin_conn, MEMORIZZ_USER, MEMORIZZ_PASSWORD, DSN
+            admin_conn, MEMORIZZ_USER, MEMORIZZ_PASSWORD, DSN, active_admin_user
         )
 
         if not success:
@@ -581,6 +1113,19 @@ def setup_oracle_user():
             print("✓ Connected!")
         except Exception as e:
             print(f"✗ Connection failed: {e}")
+
+            # Check if this is a connection refused error
+            if _is_connection_refused_error(e):
+                _print_connection_refused_help(DSN)
+            else:
+                # For other errors, show credential/configuration guidance
+                print("\nPlease check:")
+                print("  1. ORACLE_USER environment variable is set correctly")
+                print("  2. ORACLE_PASSWORD environment variable is set correctly")
+                print("  3. ORACLE_DSN environment variable is set correctly")
+                print("  4. User credentials are valid for the database")
+                print("  5. Database service is running and accessible")
+
             return False
     else:
         print(f"Using existing connection as {MEMORIZZ_USER}...")

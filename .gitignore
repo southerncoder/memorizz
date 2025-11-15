@@ -36,8 +36,18 @@ Thumbs.db
 # Test Notebooks
 dev_test.ipynb
 
-# Environment variables
+# Environment variables and secrets
 .env
+.env.*
+*.env
+*.key
+*.pem
+*.p12
+*.pfx
+secrets.json
+credentials.json
+config.local.*
+*.secret
 
 # Examples folder (local testing only)
 src/memorizz/examples/

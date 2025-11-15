@@ -59,25 +59,50 @@ For a quick setup with default settings, follow these steps:
 
 ```bash
 # Make the script executable (if needed)
-chmod +x start_oracle.sh
+chmod +x install_oracle.sh
 
 # Start Oracle Database
-./start_oracle.sh
+./install_oracle.sh
 ```
 
 **For Apple Silicon (M1/M2/M3) users:**
 ```bash
 # Oracle Free may require emulation on ARM64
 export PLATFORM_FLAG="--platform linux/amd64"
-./start_oracle.sh
+./install_oracle.sh
+```
+
+**Oracle Image Version Selection:**
+```bash
+# Use lite version (default, 1.78GB - recommended for development)
+./install_oracle.sh
+
+# Use full version (9.93GB - includes all features)
+export ORACLE_IMAGE_TAG="latest"
+./install_oracle.sh
+
+# Use custom tag
+export ORACLE_IMAGE_TAG="custom-tag"
+./install_oracle.sh
 ```
 
 This will:
-- Pull Oracle Database 23ai Free Docker image (if not already present)
+- Pull Oracle Database 23ai Free Lite Docker image (1.78GB, default) if not already present
 - Create a persistent Docker volume (`oracle-memorizz-data`) for data storage
 - Create and start a container named `oracle-memorizz`
 - Wait for the database to be ready (~2-3 minutes)
 - **Data persists** between container restarts thanks to the Docker volume
+
+**Oracle Image Versions:**
+- **Lite version (default)**: `latest-lite` - 1.78GB, faster download, recommended for development
+- **Full version**: `latest` - 9.93GB, includes all features and tools
+- **Custom tag**: Any other tag can be specified via `ORACLE_IMAGE_TAG`
+
+To use the full version:
+```bash
+export ORACLE_IMAGE_TAG="latest"
+./install_oracle.sh
+```
 
 **Default Connection Details:**
 - Host: `localhost`
@@ -244,7 +269,12 @@ You can customize all credentials using environment variables:
 ```bash
 # Set custom admin password before starting Oracle
 export ORACLE_ADMIN_PASSWORD="YourSecurePassword123!"
-./start_oracle.sh
+./install_oracle.sh
+
+# Or use full version instead of lite (default)
+export ORACLE_IMAGE_TAG="latest"
+export ORACLE_ADMIN_PASSWORD="YourSecurePassword123!"
+./install_oracle.sh
 ```
 
 #### For Database Schema Setup
@@ -266,10 +296,17 @@ python examples/setup_oracle_user.py
 |----------|---------|-------------|
 | `ORACLE_ADMIN_USER` | `system` | Oracle admin username |
 | `ORACLE_ADMIN_PASSWORD` | `MyPassword123!` | Oracle admin password |
+| `ORACLE_IMAGE_TAG` | `latest-lite` | Oracle Docker image tag (options: `latest-lite` 1.78GB, `latest` 9.93GB, or custom) |
 | `ORACLE_USER` | `memorizz_user` | MemoRizz database user |
 | `ORACLE_PASSWORD` | `SecurePass123!` | MemoRizz database password |
 | `ORACLE_DSN` | `localhost:1521/FREEPDB1` | Oracle connection string |
+| `ORACLE_TABLESPACE_NAME` | auto (`MEMORIZZ_USER_TS`) | Target tablespace for VECTOR columns; created if missing |
+| `ORACLE_DATAFILE_DIR` | auto-detected | Directory for new tablespace datafile (useful when Oracle Managed Files is disabled) |
+| `ORACLE_TABLESPACE_DATAFILE` | auto-detected | Full path override for new tablespace datafile |
+| `ORACLE_TABLESPACE_SIZE_MB` | `100` | Initial datafile size for the created tablespace |
+| `ORACLE_TABLESPACE_AUTOEXTEND_MB` | `10` | Autoextend increment for the created tablespace |
 | `OPENAI_API_KEY` | (required) | OpenAI API key for embeddings/LLM |
+| `PLATFORM_FLAG` | (empty) | Docker platform flag (use `--platform linux/amd64` for Apple Silicon) |
 
 ### Manual Oracle Setup (Alternative)
 
@@ -279,13 +316,20 @@ If you prefer to set up Oracle manually or use an existing Oracle instance:
 
 **Using Docker:**
 ```bash
-docker pull container-registry.oracle.com/database/free:latest
+# Lite version (1.78GB, recommended)
+docker pull container-registry.oracle.com/database/free:latest-lite
 
 docker run -d \
   --name oracle-memorizz \
   -p 1521:1521 \
   -e ORACLE_PWD=MyPassword123! \
-  container-registry.oracle.com/database/free:latest
+  container-registry.oracle.com/database/free:latest-lite
+
+# Or full version (9.93GB)
+# docker pull container-registry.oracle.com/database/free:latest
+# docker run -d --name oracle-memorizz -p 1521:1521 \
+#   -e ORACLE_PWD=MyPassword123! \
+#   container-registry.oracle.com/database/free:latest
 
 # Wait for database to be ready
 docker logs -f oracle-memorizz
@@ -614,7 +658,7 @@ conn.close()
 1. Use platform flag for emulation:
    ```bash
    export PLATFORM_FLAG="--platform linux/amd64"
-   ./start_oracle.sh
+   ./install_oracle.sh
    ```
 
 2. Verify Docker Desktop is using Rosetta 2 (if available):
@@ -639,6 +683,29 @@ conn.close()
    ```
 3. Check user has CREATE INDEX privilege
 4. Verify sufficient tablespace available
+
+### ORA-02236: invalid file name
+
+**Problem:** Setup script reports `ORA-02236: invalid file name` while creating the default tablespace. This happens when Oracle Managed Files isn't configured, so Oracle needs an explicit datafile location.
+
+**Solutions:**
+1. Tell the setup script where datafiles live inside the Oracle server/container:
+   ```bash
+   # Directory that already contains other datafiles (inside the container/DB host)
+   export ORACLE_DATAFILE_DIR="/opt/oracle/oradata/FREEPDB1"
+
+   # Or supply the full path you want to use
+   export ORACLE_TABLESPACE_DATAFILE="/opt/oracle/oradata/FREEPDB1/memorizz_ts01.dbf"
+   ```
+2. (Optional) Override the tablespace name or size:
+   ```bash
+   export ORACLE_TABLESPACE_NAME="MEMORIZZ_TS"
+   export ORACLE_TABLESPACE_SIZE_MB="200"
+   export ORACLE_TABLESPACE_AUTOEXTEND_MB="25"
+   ```
+3. Re-run `python -m memorizz.memory_provider.oracle.setup` (or `memorizz setup-oracle`).
+
+If you run Oracle outside Docker, update the paths to match the server's filesystem. The script will now reuse that path when creating the tablespace.
 
 ### Schema Creation Issues
 
@@ -720,7 +787,7 @@ If you've already set up MemoRizz and just need to restart Oracle:
 docker start oracle-memorizz
 
 # Or use the helper script
-./start_oracle.sh  # Will detect existing container and start it
+./install_oracle.sh  # Will detect existing container and start it
 
 # Verify it's running
 docker ps | grep oracle-memorizz
@@ -738,7 +805,7 @@ docker rm oracle-memorizz
 docker volume rm oracle-memorizz-data
 
 # Start fresh
-./start_oracle.sh
+./install_oracle.sh
 python examples/setup_oracle_user.py
 ```
 

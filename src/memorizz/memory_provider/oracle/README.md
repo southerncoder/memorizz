@@ -306,6 +306,26 @@ config = OracleConfig(
 )
 ```
 
+### ORA-02236: invalid file name
+
+Oracle raises `ORA-02236` when it needs a concrete datafile path but Oracle Managed Files is disabled. Before running the setup script again, point MemoRizz at an existing datafile directory (inside the Oracle server/container) or provide an explicit path:
+
+```bash
+export ORACLE_DATAFILE_DIR="/opt/oracle/oradata/FREEPDB1"
+# or
+export ORACLE_TABLESPACE_DATAFILE="/opt/oracle/oradata/FREEPDB1/memorizz_ts01.dbf"
+```
+
+Optional overrides:
+
+```bash
+export ORACLE_TABLESPACE_NAME="MEMORIZZ_TS"
+export ORACLE_TABLESPACE_SIZE_MB="200"
+export ORACLE_TABLESPACE_AUTOEXTEND_MB="25"
+```
+
+Rerun `memorizz setup-oracle` (or `python -m memorizz.memory_provider.oracle.setup`) after setting these variables.
+
 ### Dimension Mismatch
 
 Ensure embedding dimensions match between configuration and stored vectors:

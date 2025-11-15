@@ -62,9 +62,12 @@ pip install memorizz
 **Quick Start:**
 
 ```bash
-# 1. Start Oracle Database
-./start_oracle.sh
-# For Apple Silicon: export PLATFORM_FLAG="--platform linux/amd64" && ./start_oracle.sh
+# 1. Start Oracle Database (uses lite version by default, 1.78GB)
+./install_oracle.sh
+
+# For Apple Silicon: export PLATFORM_FLAG="--platform linux/amd64" && ./install_oracle.sh
+
+# To use full version (9.93GB): export ORACLE_IMAGE_TAG="latest" && ./install_oracle.sh
 
 # 2. Set up database schema
 # Option A: Use CLI command (recommended - works for pip-installed users)
@@ -488,12 +491,14 @@ Check out the `examples/` directory for complete working examples:
 
 **Environment Variables:**
 
-All Oracle credentials can be configured via environment variables:
+All Oracle credentials and settings can be configured via environment variables:
 - `ORACLE_ADMIN_USER` - Admin username (default: `system`)
 - `ORACLE_ADMIN_PASSWORD` - Admin password (default: `MyPassword123!`)
+- `ORACLE_IMAGE_TAG` - Docker image tag (default: `latest-lite` for 1.78GB, or `latest` for 9.93GB)
 - `ORACLE_USER` - MemoRizz user (default: `memorizz_user`)
 - `ORACLE_PASSWORD` - MemoRizz password (default: `SecurePass123!`)
 - `ORACLE_DSN` - Connection string (default: `localhost:1521/FREEPDB1`)
+- `PLATFORM_FLAG` - Docker platform flag (use `--platform linux/amd64` for Apple Silicon)
 
 See [SETUP.md](SETUP.md) for detailed configuration options and manual setup instructions.
 
