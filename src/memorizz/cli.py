@@ -11,11 +11,13 @@ def install_oracle():
     # Try to find install_oracle.sh script
     # Check multiple possible locations
     possible_paths = [
-        # Current directory
+        # Current directory (for local development)
         Path("install_oracle.sh"),
-        # Parent directory (if running from src/memorizz)
+        # Package scripts directory (when installed from PyPI)
+        Path(__file__).parent / "scripts" / "install_oracle.sh",
+        # Repository root (if installed in editable mode or running from repo)
         Path(__file__).parent.parent.parent / "install_oracle.sh",
-        # Repository root (if installed in editable mode)
+        # Alternative repository root path
         Path(__file__).parent.parent.parent.parent / "install_oracle.sh",
     ]
 

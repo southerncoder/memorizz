@@ -94,6 +94,14 @@ class OracleConfig:
 class OracleProvider(MemoryProvider):
     """Oracle Database implementation of the MemoryProvider interface."""
 
+    VECTOR_INDEX_NAME_OVERRIDES = {
+        MemoryType.CONVERSATION_MEMORY: "idx_conv_vec",
+        MemoryType.LONG_TERM_MEMORY: "idx_ltm_vec",
+        MemoryType.SHORT_TERM_MEMORY: "idx_stm_vec",
+        MemoryType.SEMANTIC_CACHE: "idx_cache_vec",
+        MemoryType.ENTITY_MEMORY: "idx_entity_memory_vec",
+    }
+
     def __init__(self, config: OracleConfig):
         """
         Initialize the Oracle provider with configuration settings.
@@ -146,11 +154,12 @@ class OracleProvider(MemoryProvider):
             return None
         elif isinstance(config.embedding_provider, str):
             try:
-                from ...embeddings import EmbeddingManager
+                from ...embeddings import EmbeddingManager, set_global_embedding_manager
 
                 provider = EmbeddingManager(
                     config.embedding_provider, config.embedding_config
                 )
+                set_global_embedding_manager(provider)
                 # Sanitize provider info to remove sensitive data
                 provider_info = provider.get_provider_info()
                 sanitized_info = provider_info.copy()
@@ -171,6 +180,9 @@ class OracleProvider(MemoryProvider):
                 )
                 raise
         else:
+            from ...embeddings import set_global_embedding_manager
+
+            set_global_embedding_manager(config.embedding_provider)
             return config.embedding_provider
 
     def _get_embedding_provider(self):
@@ -251,7 +263,7 @@ class OracleProvider(MemoryProvider):
             MemoryType.SUMMARIES: "summaries_dv",
             MemoryType.SEMANTIC_CACHE: "semantic_cache_dv",
         }
-        return view_mapping.get(memory_type, "unknown_dv")
+        return view_mapping.get(memory_type)
 
     def _get_table_name(self, memory_type: MemoryType) -> str:
         """Get the table name for a memory type."""
@@ -287,18 +299,36 @@ class OracleProvider(MemoryProvider):
 
                 if not exists:
                     # Create table with appropriate schema
-                    create_sql = f"""
-                    CREATE TABLE {table_name} (
-                        id RAW(16) DEFAULT SYS_GUID() PRIMARY KEY,
-                        data CLOB CHECK (data IS JSON),
-                        embedding VECTOR({dimensions}, FLOAT32),
-                        name VARCHAR2(255),
-                        memory_id VARCHAR2(255),
-                        agent_id VARCHAR2(255),
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                    """
+                    if memory_type == MemoryType.ENTITY_MEMORY:
+                        create_sql = f"""
+                        CREATE TABLE {table_name} (
+                            id RAW(16) DEFAULT SYS_GUID() PRIMARY KEY,
+                            entity_id VARCHAR2(255) UNIQUE NOT NULL,
+                            name VARCHAR2(255),
+                            entity_type VARCHAR2(255),
+                            attributes CLOB CHECK (attributes IS JSON),
+                            relations CLOB CHECK (relations IS JSON),
+                            metadata CLOB CHECK (metadata IS JSON),
+                            memory_id VARCHAR2(255),
+                            agent_id VARCHAR2(255),
+                            embedding VECTOR({dimensions}, FLOAT32),
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        )
+                        """
+                    else:
+                        create_sql = f"""
+                        CREATE TABLE {table_name} (
+                            id RAW(16) DEFAULT SYS_GUID() PRIMARY KEY,
+                            data CLOB CHECK (data IS JSON),
+                            embedding VECTOR({dimensions}, FLOAT32),
+                            name VARCHAR2(255),
+                            memory_id VARCHAR2(255),
+                            agent_id VARCHAR2(255),
+                            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                        )
+                        """
                     try:
                         cursor.execute(create_sql)
                         conn.commit()
@@ -348,13 +378,15 @@ class OracleProvider(MemoryProvider):
 
     def _ensure_vector_index(self, memory_type: MemoryType):
         """Ensure vector index exists for a memory type."""
-        index_key = f"{memory_type.value}_vector_index"
+        index_name = self.VECTOR_INDEX_NAME_OVERRIDES.get(
+            memory_type, f"idx_{memory_type.value}_vec"
+        )
+        index_key = index_name
 
         if index_key in self._vector_indexes_created:
             return
 
         table_name = self._get_table_name(memory_type)
-        index_name = f"idx_{memory_type.value}_vec"
 
         with self._get_connection() as conn:
             cursor = conn.cursor()
@@ -404,7 +436,116 @@ class OracleProvider(MemoryProvider):
 
     def _dict_to_doc(self, data: Dict[str, Any]) -> str:
         """Convert dictionary to JSON document."""
-        return json.dumps(data)
+        # Sanitize data to handle JsonId objects before JSON serialization
+        sanitized = self._sanitize_for_json(data)
+        return json.dumps(sanitized)
+
+    def _ensure_json_text(self, payload: Any) -> Optional[str]:
+        """Convert dict/list payloads to JSON strings for storage."""
+        if payload is None:
+            return None
+        if isinstance(payload, str):
+            return payload
+        # Sanitize payload to handle JsonId objects before JSON serialization
+        sanitized = self._sanitize_for_json(payload)
+        return json.dumps(sanitized)
+
+    @staticmethod
+    def _sanitize_for_json(value: Any) -> Any:
+        """Recursively convert objects into JSON-serializable structures, handling JsonId objects."""
+        from datetime import datetime
+
+        if isinstance(value, datetime):
+            return value.isoformat()
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+
+        # Handle Oracle JsonId objects (from oracledb Duality Views)
+        # Check both by isinstance and by type name for robustness
+        try:
+            from oracledb import JsonId
+
+            if isinstance(value, JsonId):
+                return str(value)
+        except (ImportError, AttributeError):
+            pass
+
+        # Also check by type name in case isinstance fails
+        type_str = str(type(value))
+        class_name = getattr(value, "__class__", None)
+        class_name_str = str(class_name) if class_name else ""
+        if "JsonId" in type_str or "JsonId" in class_name_str:
+            try:
+                return str(value)
+            except Exception:
+                pass
+
+        if hasattr(value, "as_json"):
+            try:
+                result = value.as_json()
+                if isinstance(result, str):
+                    return json.loads(result)
+                return result
+            except Exception:
+                pass
+
+        if hasattr(value, "as_dict"):
+            return OracleProvider._sanitize_for_json(value.as_dict())
+
+        if hasattr(value, "value"):
+            return OracleProvider._sanitize_for_json(value.value)
+
+        if isinstance(value, dict):
+            return {k: OracleProvider._sanitize_for_json(v) for k, v in value.items()}
+
+        if isinstance(value, list):
+            return [OracleProvider._sanitize_for_json(item) for item in value]
+
+        # For bytes, try to convert to UUID string if it's 16 bytes
+        if isinstance(value, bytes) and len(value) == 16:
+            try:
+                return str(uuid.UUID(bytes=value))
+            except (ValueError, TypeError):
+                pass
+
+        return str(value)
+
+    def _deserialize_json_field(self, value: Any):
+        """Convert Oracle LOB/string JSON fields to Python objects."""
+        if value is None:
+            return None
+        if hasattr(value, "as_json"):
+            try:
+                text = value.as_json()
+                return json.loads(text) if isinstance(text, str) else text
+            except Exception:
+                try:
+                    return value.as_json()
+                except Exception:
+                    pass
+        if hasattr(value, "as_dict"):
+            try:
+                return value.as_dict()
+            except Exception:
+                return None
+        if hasattr(value, "value"):
+            try:
+                return self._deserialize_json_field(value.value)
+            except Exception:
+                return value.value
+        if hasattr(value, "read"):
+            value = value.read()
+        if isinstance(value, bytes):
+            value = value.decode("utf-8")
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                return None
+            try:
+                return json.loads(value)
+            except json.JSONDecodeError:
+                return value
+        return value
 
     def store(
         self,
@@ -489,6 +630,8 @@ class OracleProvider(MemoryProvider):
             return self._store_summary_dv(data)
         elif memory_store_type == MemoryType.SEMANTIC_CACHE:
             return self._store_semantic_cache_dv(data)
+        elif memory_store_type == MemoryType.ENTITY_MEMORY:
+            return self._store_entity_memory(data)
         else:
             raise ValueError(f"Unsupported memory type: {memory_store_type}")
 
@@ -505,8 +648,15 @@ class OracleProvider(MemoryProvider):
             if not data.get(id_field):
                 data[id_field] = str(uuid.uuid4())
 
+            # Sanitize data to handle JsonId objects before JSON serialization
+            sanitized_data = self._sanitize_for_json(data)
+            if not isinstance(sanitized_data, dict):
+                raise TypeError(
+                    f"Data must be a dict after sanitization, got {type(sanitized_data)}"
+                )
+
             # Convert to JSON
-            json_doc = json.dumps(data)
+            json_doc = json.dumps(sanitized_data)
 
             try:
                 # Insert into Duality View
@@ -515,7 +665,8 @@ class OracleProvider(MemoryProvider):
                     {"json_doc": json_doc},
                 )
             except Exception as e:
-                if "ORA-00001" in str(e):  # Unique constraint violation
+                error_str = str(e)
+                if "ORA-00001" in error_str:  # Unique constraint violation
                     # Update existing document
                     cursor.execute(
                         f"""
@@ -525,6 +676,9 @@ class OracleProvider(MemoryProvider):
                     """,
                         {"json_doc": json_doc, "id": data[id_field]},
                     )
+                elif "ORA-00942" in error_str:  # View doesn't exist
+                    # Fallback to base table - this will be handled by the caller
+                    raise
                 else:
                     raise
 
@@ -648,42 +802,135 @@ class OracleProvider(MemoryProvider):
         return workflow_id
 
     def _store_shared_memory_dv(self, data: Dict[str, Any]) -> str:
-        """Store shared memory using Duality View (access_list in separate column)."""
+        """Store shared memory directly to base table (skip Duality View)."""
         memory_id = data.get("memory_id") or str(uuid.uuid4())
+        table_name = self._get_table_name(MemoryType.SHARED_MEMORY)
 
-        # Store via Duality View (excludes access_list)
-        shared_data = {
-            "memoryId": memory_id,
-            "content": data.get("content"),
-            "memoryType": data.get("memory_type"),
-            "scope": data.get("scope", "global"),
-            "ownerAgentId": data.get("owner_agent_id"),
-        }
-        # Auto-generate embedding if needed
-        embedding = self._generate_embedding_if_needed(
-            content=data.get("content", ""), existing_embedding=data.get("embedding")
-        )
-        if embedding is not None:
-            shared_data["embedding"] = embedding
+        # Sanitize content to handle JsonId objects
+        content = data.get("content")
+        if content is not None:
+            if isinstance(content, str):
+                # Already a string, use as-is
+                pass
+            else:
+                # Convert to JSON string
+                content = self._ensure_json_text(self._sanitize_for_json(content))
 
-        self._store_with_duality_view("shared_memory_dv", shared_data, "memoryId")
+        # Get embedding from data if provided (don't auto-generate for shared memory)
+        # Shared memory typically doesn't need embeddings, and they cause binding issues
+        embedding = data.get("embedding")
 
-        # Update access_list in base table (excluded from Duality View)
-        if data.get("access_list"):
-            with self._get_connection() as conn:
-                cursor = conn.cursor()
+        # Convert embedding to array.array for Oracle if present
+        # Oracle requires arrays to be array.array type, not Python lists
+        if embedding is not None and not isinstance(embedding, array.array):
+            if isinstance(embedding, list):
+                embedding = array.array("f", embedding)
+            else:
+                # If it's already an array.array or other type, use as-is
+                pass
+
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+
+            # Check if record exists
+            cursor.execute(
+                f"SELECT id FROM {table_name} WHERE memory_id = :memory_id",
+                {"memory_id": memory_id},
+            )
+            existing = cursor.fetchone()
+
+            if existing:
+                # Update existing record
+                update_fields = ["content = :content", "updated_at = SYSTIMESTAMP"]
+                params = {"memory_id": memory_id, "content": content}
+
+                if embedding is not None:
+                    update_fields.append("embedding = :embedding")
+                    params["embedding"] = embedding
+                    # Tell Oracle that embedding is an array type (VECTOR type)
+                    try:
+                        cursor.setinputsizes(embedding=oracledb.DB_TYPE_VECTOR)
+                    except AttributeError:
+                        # Fallback: use array type if DB_TYPE_VECTOR doesn't exist
+                        cursor.setinputsizes(embedding=array.array)
+
+                if data.get("access_list"):
+                    access_list_json = self._ensure_json_text(
+                        self._sanitize_for_json(data["access_list"])
+                    )
+                    update_fields.append("access_list = :access_list")
+                    params["access_list"] = access_list_json
+
                 cursor.execute(
-                    """
-                    UPDATE shared_memory
-                    SET access_list = :access_list
+                    f"""
+                    UPDATE {table_name}
+                    SET {', '.join(update_fields)}
                     WHERE memory_id = :memory_id
                 """,
-                    {
-                        "access_list": json.dumps(data["access_list"]),
-                        "memory_id": memory_id,
-                    },
+                    params,
                 )
-                conn.commit()
+            else:
+                # Insert new record
+                id_bytes = uuid.uuid4().bytes
+                insert_fields = [
+                    "id",
+                    "memory_id",
+                    "content",
+                    "memory_type",
+                    "scope",
+                    "owner_agent_id",
+                    "created_at",
+                    "updated_at",
+                ]
+                insert_values = [
+                    ":id",
+                    ":memory_id",
+                    ":content",
+                    ":memory_type",
+                    ":scope",
+                    ":owner_agent_id",
+                    "SYSTIMESTAMP",
+                    "SYSTIMESTAMP",
+                ]
+                params = {
+                    "id": id_bytes,
+                    "memory_id": memory_id,
+                    "content": content,
+                    "memory_type": data.get(
+                        "memory_type", MemoryType.SHARED_MEMORY.value
+                    ),
+                    "scope": data.get("scope", "global"),
+                    "owner_agent_id": data.get("owner_agent_id"),
+                }
+
+                if embedding is not None:
+                    insert_fields.append("embedding")
+                    insert_values.append(":embedding")
+                    params["embedding"] = embedding
+                    # Tell Oracle that embedding is an array type (VECTOR type)
+                    try:
+                        cursor.setinputsizes(embedding=oracledb.DB_TYPE_VECTOR)
+                    except AttributeError:
+                        # Fallback: use array type if DB_TYPE_VECTOR doesn't exist
+                        cursor.setinputsizes(embedding=array.array)
+
+                if data.get("access_list"):
+                    access_list_json = self._ensure_json_text(
+                        self._sanitize_for_json(data["access_list"])
+                    )
+                    insert_fields.append("access_list")
+                    insert_values.append(":access_list")
+                    params["access_list"] = access_list_json
+
+                cursor.execute(
+                    f"""
+                    INSERT INTO {table_name} ({', '.join(insert_fields)})
+                    VALUES ({', '.join(insert_values)})
+                """,
+                    params,
+                )
+
+            conn.commit()
 
         return memory_id
 
@@ -749,6 +996,72 @@ class OracleProvider(MemoryProvider):
         return self._store_with_duality_view(
             "semantic_cache_dv", cache_data, "cacheKey"
         )
+
+    def _store_entity_memory(self, data: Dict[str, Any]) -> str:
+        """Store entity memory directly in the base table."""
+        entity_id = data.get("entity_id") or str(uuid.uuid4())
+        record_id = data.get("id")
+        if record_id:
+            try:
+                record_id = uuid.UUID(record_id).bytes
+            except ValueError:
+                record_id = uuid.uuid4().bytes
+        else:
+            record_id = uuid.uuid4().bytes
+
+        attributes = self._ensure_json_text(data.get("attributes"))
+        relations = self._ensure_json_text(data.get("relations"))
+        metadata = self._ensure_json_text(data.get("metadata"))
+
+        embedding = data.get("embedding")
+        if isinstance(embedding, list):
+            embedding = array.array("f", embedding)
+
+        params = {
+            "id": record_id,
+            "entity_id": entity_id,
+            "name": data.get("name"),
+            "entity_type": data.get("entity_type"),
+            "attributes": attributes,
+            "relations": relations,
+            "metadata": metadata,
+            "memory_id": data.get("memory_id"),
+            "agent_id": data.get("agent_id"),
+            "embedding": embedding,
+        }
+
+        table_name = self._get_table_name(MemoryType.ENTITY_MEMORY)
+        merge_sql = f"""
+            MERGE INTO {table_name} tgt
+            USING (SELECT :entity_id AS entity_id FROM dual) src
+            ON (tgt.entity_id = src.entity_id)
+            WHEN MATCHED THEN UPDATE SET
+                name = :name,
+                entity_type = :entity_type,
+                attributes = :attributes,
+                relations = :relations,
+                metadata = :metadata,
+                memory_id = :memory_id,
+                agent_id = :agent_id,
+                embedding = :embedding,
+                updated_at = CURRENT_TIMESTAMP
+            WHEN NOT MATCHED THEN INSERT (
+                id, entity_id, name, entity_type, attributes,
+                relations, metadata, memory_id, agent_id,
+                embedding, created_at, updated_at
+            ) VALUES (
+                :id, :entity_id, :name, :entity_type, :attributes,
+                :relations, :metadata, :memory_id, :agent_id,
+                :embedding, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP
+            )
+        """
+
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(merge_sql, params)
+            conn.commit()
+
+        return entity_id
 
     def retrieve_by_query(
         self,
@@ -907,7 +1220,11 @@ class OracleProvider(MemoryProvider):
                         doc["embedding"] = list(row[8])
                 else:
                     # Generic handling for other types
-                    doc = dict(zip([desc[0] for desc in cursor.description], row))
+                    columns = [desc[0].lower() for desc in cursor.description]
+                    doc = dict(zip(columns, row))
+                    if memory_store_type == MemoryType.ENTITY_MEMORY:
+                        for key in ("attributes", "relations", "metadata"):
+                            doc[key] = self._deserialize_json_field(doc.get(key))
                     if not include_embedding:
                         doc.pop("embedding", None)
 
@@ -936,6 +1253,75 @@ class OracleProvider(MemoryProvider):
         # Special handling for MEMAGENT
         if memory_store_type == MemoryType.MEMAGENT:
             return self.retrieve_memagent(id)
+        if memory_store_type == MemoryType.ENTITY_MEMORY:
+            table_name = self._get_table_name(memory_store_type)
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    f"""
+                    SELECT * FROM {table_name}
+                    WHERE entity_id = :entity_id
+                    """,
+                    {"entity_id": id},
+                )
+                row = cursor.fetchone()
+                if row:
+                    columns = [desc[0].lower() for desc in cursor.description]
+                    record = dict(zip(columns, row))
+                    for key in ("attributes", "relations", "metadata"):
+                        record[key] = self._deserialize_json_field(record.get(key))
+                    return record
+                return None
+
+        # For shared memory, query base table directly (skip Duality View)
+        if memory_store_type == MemoryType.SHARED_MEMORY:
+            table_name = self._get_table_name(memory_store_type)
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    f"""
+                    SELECT id, memory_id, content, memory_type, scope, owner_agent_id,
+                           embedding, created_at, updated_at, access_list
+                    FROM {table_name}
+                    WHERE memory_id = :memory_id
+                    """,
+                    {"memory_id": id},
+                )
+                row = cursor.fetchone()
+                if row:
+                    # Handle CLOB content
+                    content = row[2]
+                    if hasattr(content, "read"):
+                        content = content.read()
+                    elif content:
+                        content = self._deserialize_json_field(content)
+
+                    # Handle access_list
+                    access_list = row[9] if len(row) > 9 else None
+                    if access_list and hasattr(access_list, "read"):
+                        access_list = access_list.read()
+                    if access_list:
+                        access_list = self._deserialize_json_field(access_list)
+
+                    result = {
+                        "_id": str(uuid.UUID(bytes=row[0])),
+                        "memory_id": row[1],
+                        "content": content,
+                        "memory_type": row[3],
+                        "scope": row[4],
+                        "owner_agent_id": row[5],
+                        "created_at": row[7].isoformat() if row[7] else None,
+                        "updated_at": row[8].isoformat() if row[8] else None,
+                    }
+
+                    if row[6] is not None:  # embedding
+                        result["embedding"] = list(row[6])
+
+                    if access_list:
+                        result["access_list"] = access_list
+
+                    return result
+                return None
 
         view_name = self._get_duality_view_name(memory_store_type)
         table_name = self._get_table_name(memory_store_type)
@@ -951,15 +1337,16 @@ class OracleProvider(MemoryProvider):
                     MemoryType.LONG_TERM_MEMORY: "memoryId",
                     MemoryType.SHORT_TERM_MEMORY: "memoryId",
                     MemoryType.WORKFLOW_MEMORY: "workflowId",
-                    MemoryType.SHARED_MEMORY: "memoryId",
                     MemoryType.SUMMARIES: "summaryId",
                     MemoryType.SEMANTIC_CACHE: "cacheKey",
+                    MemoryType.ENTITY_MEMORY: "entityId",
                 }
 
                 id_field = id_field_map.get(memory_store_type, "memoryId")
 
                 cursor.execute(
-                    f'SELECT data FROM {view_name} WHERE "{id_field}" = :id', {"id": id}
+                    f"SELECT data FROM {view_name} WHERE JSON_VALUE(data, '$.\"{id_field}\"') = :id",
+                    {"id": id},
                 )
 
                 row = cursor.fetchone()
@@ -995,9 +1382,32 @@ class OracleProvider(MemoryProvider):
         self, doc: Dict[str, Any], memory_type: MemoryType
     ) -> Dict[str, Any]:
         """Convert Duality View JSON (camelCase) to Python dict (snake_case)."""
+        # Convert _id from bytes/JsonId to UUID string if needed
+        _id_value = doc.get("_id")
+        if _id_value is not None:
+            if isinstance(_id_value, bytes):
+                # Convert bytes (RAW(16)) to UUID string
+                try:
+                    _id_value = str(uuid.UUID(bytes=_id_value))
+                except (ValueError, TypeError):
+                    # If conversion fails, try to convert to string as fallback
+                    _id_value = str(_id_value)
+            else:
+                # Handle JsonId objects (from oracledb Duality Views)
+                try:
+                    from oracledb import JsonId
+
+                    if isinstance(_id_value, JsonId):
+                        _id_value = str(_id_value)
+                except (ImportError, AttributeError):
+                    pass
+                # If it's already a string, keep it as-is
+                if not isinstance(_id_value, str):
+                    _id_value = str(_id_value)
+
         # Common conversions
         result = {
-            "_id": doc.get("_id"),
+            "_id": _id_value,
         }
 
         # Memory type specific conversions
@@ -1060,7 +1470,7 @@ class OracleProvider(MemoryProvider):
             result.update(
                 {
                     "memory_id": doc.get("memoryId"),
-                    "content": doc.get("content"),
+                    "content": self._deserialize_json_field(doc.get("content")),
                     "memory_type": doc.get("memoryType"),
                     "scope": doc.get("scope"),
                     "owner_agent_id": doc.get("ownerAgentId"),
@@ -1096,36 +1506,74 @@ class OracleProvider(MemoryProvider):
                     "expires_at": doc.get("expiresAt"),
                 }
             )
+        elif memory_type == MemoryType.ENTITY_MEMORY:
+            result.update(
+                {
+                    "entity_id": doc.get("entityId"),
+                    "name": doc.get("name"),
+                    "entity_type": doc.get("entityType"),
+                    "attributes": doc.get("attributes"),
+                    "relations": doc.get("relations"),
+                    "metadata": doc.get("metadata"),
+                    "memory_id": doc.get("memoryId"),
+                    "embedding": doc.get("embedding"),
+                    "created_at": doc.get("createdAt"),
+                    "updated_at": doc.get("updatedAt"),
+                }
+            )
 
         return result
 
     def retrieve_by_name(
         self, name: str, memory_store_type: MemoryType, include_embedding: bool = False
     ) -> Optional[Dict[str, Any]]:
-        """Retrieve a document by name using Duality Views."""
         view_name = self._get_duality_view_name(memory_store_type)
+        table_name = self._get_table_name(memory_store_type)
 
         with self._get_connection() as conn:
             cursor = conn.cursor()
 
+            if view_name:
+                try:
+                    cursor.execute(
+                        f"""
+                        SELECT data FROM {view_name}
+                        WHERE name = :name
+                        FETCH FIRST 1 ROWS ONLY
+                        """,
+                        {"name": name},
+                    )
+                    row = cursor.fetchone()
+                    if row:
+                        doc = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+                        converted_doc = self._convert_dv_to_dict(doc, memory_store_type)
+                        if not include_embedding:
+                            converted_doc.pop("embedding", None)
+                        return converted_doc
+                except Exception as e:
+                    logger.warning(
+                        f"Duality View {view_name} lookup failed, falling back to base table {table_name}: {e}"
+                    )
+
             cursor.execute(
                 f"""
-                SELECT data FROM {view_name}
+                SELECT * FROM {table_name}
                 WHERE name = :name
                 FETCH FIRST 1 ROWS ONLY
                 """,
                 {"name": name},
             )
-
             row = cursor.fetchone()
-            if row:
-                doc = json.loads(row[0]) if isinstance(row[0], str) else row[0]
-                converted_doc = self._convert_dv_to_dict(doc, memory_store_type)
-                if not include_embedding:
-                    converted_doc.pop("embedding", None)
-                return converted_doc
-
-            return None
+            if not row:
+                return None
+            columns = [desc[0].lower() for desc in cursor.description]
+            record = dict(zip(columns, row))
+            if memory_store_type == MemoryType.ENTITY_MEMORY:
+                for key in ("attributes", "relations", "metadata"):
+                    record[key] = self._deserialize_json_field(record.get(key))
+            if not include_embedding and "embedding" in record:
+                record.pop("embedding", None)
+            return record
 
     def delete_by_id(self, id: str, memory_store_type: MemoryType) -> bool:
         """Delete a document by ID."""
@@ -1175,22 +1623,117 @@ class OracleProvider(MemoryProvider):
     ) -> List[Dict[str, Any]]:
         """List all documents within a memory store type using Duality Views."""
         view_name = self._get_duality_view_name(memory_store_type)
+        table_name = self._get_table_name(memory_store_type)
 
         with self._get_connection() as conn:
             cursor = conn.cursor()
 
-            cursor.execute(f"SELECT data FROM {view_name}")
+            if view_name:
+                try:
+                    cursor.execute(f"SELECT data FROM {view_name}")
+                    results = []
+                    for row in cursor:
+                        doc = json.loads(row[0]) if isinstance(row[0], str) else row[0]
+                        converted_doc = self._convert_dv_to_dict(doc, memory_store_type)
+                        if not include_embedding:
+                            converted_doc.pop("embedding", None)
+                        results.append(converted_doc)
+                    return results
+                except Exception as e:
+                    logger.warning(
+                        f"Duality View {view_name} does not exist, falling back to base table {table_name}: {e}"
+                    )
 
-            results = []
-            for row in cursor:
-                doc = json.loads(row[0]) if isinstance(row[0], str) else row[0]
-                # Convert to snake_case
-                converted_doc = self._convert_dv_to_dict(doc, memory_store_type)
-                if not include_embedding:
-                    converted_doc.pop("embedding", None)
-                results.append(converted_doc)
+            return self._list_all_from_table(
+                table_name, memory_store_type, include_embedding
+            )
 
-            return results
+    def _list_all_from_table(
+        self,
+        table_name: str,
+        memory_store_type: MemoryType,
+        include_embedding: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Fallback method to list all documents from base table when Duality View doesn't exist."""
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+
+            # Build query based on memory type
+            if memory_store_type == MemoryType.ENTITY_MEMORY:
+                # Entity memory has individual columns, not a data column
+                query = f"""
+                    SELECT
+                        id, entity_id, name, entity_type, attributes, relations,
+                        metadata, memory_id, agent_id, embedding, created_at, updated_at
+                    FROM {table_name}
+                """
+                cursor.execute(query)
+
+                results = []
+                for row in cursor:
+                    try:
+                        attributes = self._deserialize_json_field(row[4]) or []
+                        relations = self._deserialize_json_field(row[5]) or []
+                        metadata = self._deserialize_json_field(row[6]) or {}
+
+                        doc = {
+                            "_id": str(uuid.UUID(bytes=row[0])) if row[0] else None,
+                            "entity_id": row[1],
+                            "name": row[2],
+                            "entity_type": row[3],
+                            "attributes": attributes,
+                            "relations": relations,
+                            "metadata": metadata,
+                            "memory_id": row[7],
+                            "agent_id": row[8],
+                        }
+
+                        # Handle embedding
+                        if include_embedding and row[9] is not None:
+                            doc["embedding"] = row[9]
+
+                        # Handle timestamps
+                        if row[10]:
+                            doc["created_at"] = (
+                                row[10].isoformat()
+                                if hasattr(row[10], "isoformat")
+                                else str(row[10])
+                            )
+                        if row[11]:
+                            doc["updated_at"] = (
+                                row[11].isoformat()
+                                if hasattr(row[11], "isoformat")
+                                else str(row[11])
+                            )
+
+                        results.append(doc)
+                    except Exception as row_error:
+                        logger.warning(
+                            f"Error processing entity_memory row: {row_error}"
+                        )
+                        continue
+
+                return results
+            else:
+                # For other memory types, try to query data column
+                try:
+                    query = f"SELECT id, data FROM {table_name}"
+                    cursor.execute(query)
+
+                    results = []
+                    for row in cursor:
+                        doc = self._doc_to_dict(row[1], include_embedding)
+                        if row[0]:
+                            doc["_id"] = str(uuid.UUID(bytes=row[0]))
+                        results.append(doc)
+
+                    return results
+                except Exception as table_error:
+                    logger.error(
+                        f"Failed to query base table {table_name}: {table_error}"
+                    )
+                    # Return empty list if table query also fails
+                    return []
 
     def retrieve_conversation_history_ordered_by_timestamp(
         self,
@@ -1275,9 +1818,12 @@ class OracleProvider(MemoryProvider):
         self, id: str, data: Dict[str, Any], memory_store_type: MemoryType
     ) -> bool:
         """Update a document by ID."""
-        # For semantic cache, update base table directly (not Duality View)
+        # For semantic cache and shared memory, update base table directly (not Duality View)
         if memory_store_type == MemoryType.SEMANTIC_CACHE:
             return self._update_semantic_cache_by_key(id, data)
+
+        if memory_store_type == MemoryType.SHARED_MEMORY:
+            return self._update_shared_memory_by_id(id, data)
 
         # For other types, use Duality Views
         view_name = self._get_duality_view_name(memory_store_type)
@@ -1300,7 +1846,8 @@ class OracleProvider(MemoryProvider):
 
             # Get existing document from Duality View
             cursor.execute(
-                f'SELECT data FROM {view_name} WHERE "{id_field}" = :id', {"id": id}
+                f"SELECT data FROM {view_name} WHERE JSON_VALUE(data, '$.\"{id_field}\"') = :id",
+                {"id": id},
             )
             row = cursor.fetchone()
 
@@ -1310,7 +1857,15 @@ class OracleProvider(MemoryProvider):
             # Parse and merge with existing data
             existing_doc = json.loads(row[0]) if isinstance(row[0], str) else row[0]
 
-            # Convert update data from snake_case to camelCase
+            # Sanitize existing_doc to handle any JsonId objects that might be in nested structures
+            existing_doc = self._sanitize_for_json(existing_doc)
+            if not isinstance(existing_doc, dict):
+                logger.error(
+                    f"Existing document is not a dict after sanitization: {type(existing_doc)}"
+                )
+                return False
+
+            # Convert update data from snake_case to camelCase and sanitize
             field_mapping = {
                 "memory_id": "memoryId",
                 "conversation_id": "conversationId",
@@ -1328,9 +1883,25 @@ class OracleProvider(MemoryProvider):
                 "access_count": "accessCount",
             }
 
-            for key, value in data.items():
+            # Sanitize incoming data before merging
+            sanitized_data = self._sanitize_for_json(data)
+            if not isinstance(sanitized_data, dict):
+                logger.error(
+                    f"Update data is not a dict after sanitization: {type(sanitized_data)}"
+                )
+                return False
+
+            for key, value in sanitized_data.items():
                 camel_key = field_mapping.get(key, key)
                 existing_doc[camel_key] = value
+
+            # Sanitize one more time before JSON serialization to catch any missed JsonId objects
+            existing_doc = self._sanitize_for_json(existing_doc)
+            if not isinstance(existing_doc, dict):
+                logger.error(
+                    f"Document is not a dict after final sanitization: {type(existing_doc)}"
+                )
+                return False
 
             # Update via Duality View
             doc_json = json.dumps(existing_doc)
@@ -1339,9 +1910,67 @@ class OracleProvider(MemoryProvider):
                 f"""
                 UPDATE {view_name}
                 SET data = :data
-                WHERE "{id_field}" = :id
+                WHERE JSON_VALUE(data, '$."{id_field}"') = :id
                 """,
                 {"data": doc_json, "id": id},
+            )
+            conn.commit()
+
+            return cursor.rowcount > 0
+
+    def _update_shared_memory_by_id(self, memory_id: str, data: Dict[str, Any]) -> bool:
+        """Update shared memory entry directly in base table by memory_id."""
+        table_name = self._get_table_name(MemoryType.SHARED_MEMORY)
+
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+
+            # Build SET clause from data
+            set_clauses = ["updated_at = SYSTIMESTAMP"]
+            params = {"memory_id": memory_id}
+
+            for key, value in data.items():
+                # Skip fields that we handle specially or don't want to update
+                if key in ("id", "memory_id", "_id", "updated_at"):
+                    continue
+
+                if key == "content":
+                    # Sanitize and convert content to JSON string
+                    if value is not None:
+                        if isinstance(value, str):
+                            params["content"] = value
+                        else:
+                            params["content"] = self._ensure_json_text(
+                                self._sanitize_for_json(value)
+                            )
+                        set_clauses.append("content = :content")
+                elif key == "access_list":
+                    # Sanitize and convert access_list to JSON string
+                    if value is not None:
+                        params["access_list"] = self._ensure_json_text(
+                            self._sanitize_for_json(value)
+                        )
+                        set_clauses.append("access_list = :access_list")
+                else:
+                    # Map snake_case to database column names
+                    db_key = key
+                    if key == "owner_agent_id":
+                        db_key = "owner_agent_id"
+                    set_clauses.append(f"{db_key} = :{key}")
+                    params[key] = value
+
+            if len(set_clauses) == 1:  # Only updated_at
+                return False
+
+            set_sql = ", ".join(set_clauses)
+
+            cursor.execute(
+                f"""
+                UPDATE {table_name}
+                SET {set_sql}
+                WHERE memory_id = :memory_id
+                """,
+                params,
             )
             conn.commit()
 
@@ -1772,9 +2401,13 @@ class OracleProvider(MemoryProvider):
                                 f"Failed to generate embedding for tool: {e}"
                             )
 
+                    raw_tool_id = tool_meta.get("_id") or tool_meta.get(
+                        "name", str(uuid.uuid4())
+                    )
+                    tool_id = f"{agent_id_str}:{raw_tool_id}"
+
                     tool_json = {
-                        "toolId": tool_meta.get("_id")
-                        or tool_meta.get("name", str(uuid.uuid4())),
+                        "toolId": tool_id,
                         "name": tool_meta.get("name", "unknown_tool"),
                         "description": tool_meta.get("description", ""),
                         "signature": tool_meta.get("signature", ""),
@@ -1800,7 +2433,7 @@ class OracleProvider(MemoryProvider):
                                 """
                                 UPDATE toolbox_dv
                                 SET data = :json_doc
-                                WHERE toolId = :tool_id
+                                WHERE JSON_VALUE(data, '$."toolId"') = :tool_id
                             """,
                                 {
                                     "json_doc": json.dumps(tool_json),
@@ -2364,9 +2997,42 @@ class OracleProvider(MemoryProvider):
 
     def update_memagent_memory_ids(self, agent_id: str, memory_ids: List[str]) -> bool:
         """Update the memory_ids of a memagent."""
-        return self.update_by_id(
-            agent_id, {"memory_ids": memory_ids}, MemoryType.MEMAGENT
-        )
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    "SELECT id FROM agents WHERE agent_id = :agent_id",
+                    {"agent_id": agent_id},
+                )
+                row = cursor.fetchone()
+                if not row:
+                    logger.error(
+                        "Cannot update memory_ids for unknown agent_id=%s", agent_id
+                    )
+                    return False
+
+                agent_uuid = row[0]
+                cursor.execute(
+                    "DELETE FROM agent_memories WHERE agent_id = :agent_id",
+                    {"agent_id": agent_uuid},
+                )
+
+                for memory_id in memory_ids:
+                    cursor.execute(
+                        """
+                        INSERT INTO agent_memories (agent_id, memory_id)
+                        VALUES (:agent_id, :memory_id)
+                    """,
+                        {"agent_id": agent_uuid, "memory_id": memory_id},
+                    )
+
+                conn.commit()
+                return True
+        except Exception as exc:
+            logger.error(
+                "Failed to update memagent memory_ids for %s: %s", agent_id, exc
+            )
+            return False
 
     def delete_memagent_memory_ids(self, agent_id: str) -> bool:
         """Delete the memory_ids of a memagent."""
@@ -2414,6 +3080,10 @@ class OracleProvider(MemoryProvider):
             agents.append(agent)
 
         return agents
+
+    def supports_entity_memory(self) -> bool:
+        """Oracle provider fully supports entity memory operations."""
+        return True
 
     def retrieve_memagent(self, agent_id: str) -> "MemAgentModel":
         """Retrieve a memagent using JSON Relational Duality View."""
