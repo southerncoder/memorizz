@@ -33,7 +33,26 @@ def __getattr__(name):
         return _lazy_import_mongodb()
     elif name == "OracleProvider":
         return _lazy_import_oracle()
+    elif name in ("FileSystemProvider", "FileSystemConfig"):
+        try:
+            from .filesystem import FileSystemConfig, FileSystemProvider
+
+            return (
+                FileSystemProvider if name == "FileSystemProvider" else FileSystemConfig
+            )
+        except ImportError as e:
+            raise ImportError(
+                "Filesystem provider requires optional dependencies. "
+                "Install FAISS (pip install faiss-cpu) for vector search support."
+            ) from e
     raise AttributeError(f"module '{__name__}' has no attribute '{name}'")
 
 
-__all__ = ["MemoryProvider", "MongoDBProvider", "OracleProvider", "MemoryType"]
+__all__ = [
+    "MemoryProvider",
+    "MongoDBProvider",
+    "OracleProvider",
+    "FileSystemProvider",
+    "FileSystemConfig",
+    "MemoryType",
+]

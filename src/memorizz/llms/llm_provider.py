@@ -71,3 +71,11 @@ class LLMProvider(Protocol):
         This is used for saving and reconstructing the agent.
         """
         ...
+
+    def get_last_usage(self) -> Optional[Dict[str, int]]:
+        """Return token usage details (prompt/completion/total) from the most recent call."""
+        ...
+
+    def get_context_window_tokens(self) -> Optional[int]:
+        """Return the provider's context window size in tokens, when known."""
+        ...

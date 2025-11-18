@@ -314,6 +314,29 @@ CREATE INDEX idx_cache_agent_id ON semantic_cache(agent_id);
 CREATE INDEX idx_cache_expires_at ON semantic_cache(expires_at);
 
 -- ==============================================================================
+-- ENTITY_MEMORY TABLE (Structured entity facts)
+-- ==============================================================================
+CREATE TABLE entity_memory (
+    id RAW(16) DEFAULT SYS_GUID() PRIMARY KEY,
+    entity_id VARCHAR2(255) UNIQUE NOT NULL,
+    name VARCHAR2(255),
+    entity_type VARCHAR2(255),
+    attributes CLOB,
+    relations CLOB,
+    metadata CLOB,
+    memory_id VARCHAR2(255),
+    agent_id VARCHAR2(255),
+    embedding VECTOR,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Indexes
+CREATE INDEX idx_entity_memory_entity_id ON entity_memory(entity_id);
+CREATE INDEX idx_entity_memory_memory_id ON entity_memory(memory_id);
+CREATE INDEX idx_entity_memory_agent_id ON entity_memory(agent_id);
+
+-- ==============================================================================
 -- VECTOR INDEXES (For similarity search - Oracle 23ai+)
 -- ==============================================================================
 
@@ -373,6 +396,12 @@ WITH TARGET ACCURACY 95;
 
 -- Semantic cache vector index
 CREATE VECTOR INDEX idx_cache_vec ON semantic_cache(embedding)
+ORGANIZATION NEIGHBOR PARTITIONS
+DISTANCE COSINE
+WITH TARGET ACCURACY 95;
+
+-- Entity memory vector index
+CREATE VECTOR INDEX idx_entity_memory_vec ON entity_memory(embedding)
 ORGANIZATION NEIGHBOR PARTITIONS
 DISTANCE COSINE
 WITH TARGET ACCURACY 95;

@@ -1,6 +1,8 @@
 """Manager components for MemAgent functionality."""
 
 from .cache_manager import CacheManager
+from .entity_memory_manager import EntityMemoryManager
+from .internet_access_manager import InternetAccessManager
 from .memory_manager import MemoryManager
 from .persona_manager import PersonaManager
 from .tool_manager import ToolManager
@@ -12,4 +14,6 @@ __all__ = [
     "CacheManager",
     "PersonaManager",
     "WorkflowManager",
+    "EntityMemoryManager",
+    "InternetAccessManager",
 ]

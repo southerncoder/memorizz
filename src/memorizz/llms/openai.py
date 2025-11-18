@@ -20,7 +20,12 @@ class OpenAI(LLMProvider):
     A class for interacting with the OpenAI API.
     """
 
-    def __init__(self, api_key: Optional[str] = None, model: str = "gpt-4o"):
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        model: str = "gpt-4o",
+        context_window_tokens: Optional[int] = None,
+    ):
         """
         Initialize the OpenAI client.
 
@@ -36,6 +41,28 @@ class OpenAI(LLMProvider):
 
         self.client = openai.OpenAI(api_key=api_key)
         self.model = model
+        self.context_window_tokens = (
+            context_window_tokens or self._infer_context_window_tokens(model)
+        )
+        self._last_usage: Optional[Dict[str, int]] = None
+
+    def _infer_context_window_tokens(self, model: str) -> int:
+        """Best-effort mapping of well-known OpenAI models to their context window."""
+        normalized = model.lower() if model else ""
+        context_map = {
+            "gpt-4o": 128_000,
+            "gpt-4o-mini": 128_000,
+            "gpt-4.1": 128_000,
+            "gpt-4.1-mini": 128_000,
+            "gpt-4.1-turbo": 128_000,
+            "gpt-4-turbo": 128_000,
+            "gpt-4.1-preview": 128_000,
+            "gpt-4o-mini-high": 128_000,
+            "gpt-4o-mini-low": 128_000,
+            "gpt-4o-mini-4096": 4_096,
+            "gpt-4o-realtime-preview": 128_000,
+        }
+        return context_map.get(normalized, 128_000)
 
     def get_config(self) -> Dict[str, Any]:
         """Returns a serializable configuration for the OpenAI provider."""
@@ -174,6 +201,7 @@ class OpenAI(LLMProvider):
             kwargs["tool_choice"] = tool_choice
 
         response = self.client.chat.completions.create(**kwargs)
+        self._last_usage = self._extract_usage(response)
 
         # If there are tool calls, return the full response object
         if response.choices[0].message.tool_calls:
@@ -181,3 +209,22 @@ class OpenAI(LLMProvider):
 
         # Otherwise return just the text content
         return response.choices[0].message.content
+
+    def _extract_usage(self, response: Any) -> Optional[Dict[str, int]]:
+        usage = getattr(response, "usage", None)
+        if not usage:
+            return None
+        try:
+            return {
+                "prompt_tokens": getattr(usage, "prompt_tokens", None),
+                "completion_tokens": getattr(usage, "completion_tokens", None),
+                "total_tokens": getattr(usage, "total_tokens", None),
+            }
+        except Exception:
+            return None
+
+    def get_last_usage(self) -> Optional[Dict[str, int]]:
+        return self._last_usage
+
+    def get_context_window_tokens(self) -> Optional[int]:
+        return self.context_window_tokens

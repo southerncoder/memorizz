@@ -3,6 +3,8 @@
 import logging
 from typing import TYPE_CHECKING, Any, Dict, List, Union
 
+from ...enums import ApplicationMode
+from ...internet_access import get_default_internet_access_provider
 from ..models import MemAgentConfig
 
 if TYPE_CHECKING:
@@ -32,6 +34,8 @@ class MemAgentBuilder:
         self._embedding_provider = None
         self._embedding_config = None
         self._semantic_cache_config = None
+        self._entity_memory_enabled = None
+        self._internet_access_provider = None
 
     def with_instruction(self, instruction: str) -> "MemAgentBuilder":
         """Set the agent instruction."""
@@ -85,6 +89,11 @@ class MemAgentBuilder:
             self._memory_ids = memory_ids
         return self
 
+    def with_internet_access_provider(self, provider: Any) -> "MemAgentBuilder":
+        """Attach an internet access provider."""
+        self._internet_access_provider = provider
+        return self
+
     def with_semantic_cache(
         self, enabled: bool = True, threshold: float = 0.85, scope: str = "local"
     ) -> "MemAgentBuilder":
@@ -113,6 +122,11 @@ class MemAgentBuilder:
     def with_application_mode(self, mode: str) -> "MemAgentBuilder":
         """Set the application mode."""
         self.config.application_mode = mode
+        return self
+
+    def with_entity_memory(self, enabled: bool = True) -> "MemAgentBuilder":
+        """Explicitly enable or disable entity memory for the agent."""
+        self._entity_memory_enabled = enabled
         return self
 
     def with_tool_access(self, access: str) -> "MemAgentBuilder":
@@ -159,9 +173,20 @@ class MemAgentBuilder:
                 embedding_config=self._embedding_config,
                 semantic_cache=self.config.semantic_cache,
                 semantic_cache_config=self._semantic_cache_config,
+                context_window_tokens=getattr(
+                    self.config, "context_window_tokens", None
+                ),
+                internet_access_provider=self._internet_access_provider,
             )
 
             logger.info(f"MemAgent built successfully with {len(self._tools)} tools")
+
+            if self._entity_memory_enabled is not None:
+                try:
+                    agent.with_entity_memory(self._entity_memory_enabled)
+                except Exception as exc:
+                    logger.warning(f"Failed to configure entity memory: {exc}")
+
             return agent
 
         except Exception as e:
@@ -182,6 +207,7 @@ class MemAgentBuilder:
         new_builder._model = self._model
         new_builder._llm_config = self._llm_config.copy() if self._llm_config else None
         new_builder._tools = self._tools.copy()
+        new_builder._internet_access_provider = self._internet_access_provider
         new_builder._persona = self._persona
         new_builder._memory_provider = self._memory_provider
         new_builder._memory_ids = self._memory_ids.copy()
@@ -241,5 +267,23 @@ def create_task_agent(
 
     if tools:
         builder = builder.with_tools(tools)
+
+    return builder
+
+
+def create_deep_research_agent(
+    instruction: str = "You are a deep research agent. Break complex questions into sub-tasks, call tools, and return a sourced synthesis.",
+    internet_provider=None,
+) -> MemAgentBuilder:
+    """Create a builder configured for Deep Research mode with internet tooling."""
+    builder = (
+        MemAgentBuilder()
+        .with_instruction(instruction)
+        .with_application_mode(ApplicationMode.DEEP_RESEARCH.value)
+    )
+
+    provider = internet_provider or get_default_internet_access_provider()
+    if provider:
+        builder = builder.with_internet_access_provider(provider)
 
     return builder

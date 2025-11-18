@@ -61,14 +61,24 @@ class TaskDecomposer:
         capabilities = {}
 
         for agent in delegates:
+            persona_context = None
+            if hasattr(agent, "persona_manager") and agent.persona_manager:
+                persona_obj = getattr(agent.persona_manager, "current_persona", None)
+                if persona_obj and hasattr(persona_obj, "generate_system_prompt_input"):
+                    persona_context = persona_obj.generate_system_prompt_input()
+                elif persona_obj:
+                    persona_context = str(persona_obj)
+            else:
+                persona_obj = getattr(agent, "persona", None)
+                if persona_obj and hasattr(persona_obj, "generate_system_prompt_input"):
+                    persona_context = persona_obj.generate_system_prompt_input()
+                elif persona_obj:
+                    persona_context = str(persona_obj)
+
             agent_capabilities = {
                 "agent_id": agent.agent_id,
                 "instruction": agent.instruction,
-                "persona": (
-                    agent.persona.generate_system_prompt_input()
-                    if agent.persona
-                    else None
-                ),
+                "persona": persona_context,
                 "tools": [],
                 "application_mode": agent.application_mode.value,
             }

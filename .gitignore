@@ -24,6 +24,7 @@ wheels/
 # Virtual environments
 venv/
 ENV/
+.venv/
 
 # IDEs
 .vscode/
@@ -54,3 +55,7 @@ src/memorizz/examples/
 
 # Bug reports
 .bug_tracking/
+
+# Build artifacts
+site/
+*.map

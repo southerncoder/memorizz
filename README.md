@@ -31,6 +31,7 @@ MemoRizz provides flexible single and multi-agent architectures that allow you t
 - 🔍 **Semantic Search**: Find relevant information using natural language with AI Vector Search
 - 🛠️ **Tool Integration**: Automatically discover and execute functions
 - 👤 **Persona System**: Create consistent, specialized agent personalities
+- 📁 **Local Filesystem Provider**: Zero-database option powered by FAISS for local development
 - 🗄️ **Oracle AI Database**: Built-in integration with Oracle 23ai for advanced vector search and JSON Duality Views
 - ⚡ **Semantic Cache**: Speed up responses and reduce costs with intelligent caching
 
@@ -54,6 +55,14 @@ pip install memorizz
 - Python 3.7+
 - Oracle Database 23ai or higher (for AI Vector Search and JSON Duality Views)
 - OpenAI API key (for embeddings and LLM functionality)
+
+Hugging Face embeddings/LLMs are included in the base install, so `pip install memorizz` gives you those dependencies automatically. For other optional stacks, install the matching extra:
+
+```bash
+pip install memorizz[ollama]       # Ollama embeddings
+pip install memorizz[voyageai]     # VoyageAI embeddings
+pip install memorizz[filesystem]   # Filesystem provider + FAISS vector search
+```
 
 ### Oracle Database Setup
 
@@ -156,6 +165,144 @@ print(response)
 response = agent.run("What did I tell you about myself?")
 print(response)  # Agent remembers John is a software engineer
 ```
+
+### Filesystem Provider (local development)
+
+Need a zero-dependency backend for local experiments? The filesystem provider persists every memory bucket as JSON files and uses FAISS for vector search (install with `pip install memorizz[filesystem]`). Switching providers is as simple as changing the config:
+
+```python
+from pathlib import Path
+from memorizz.memory_provider import FileSystemConfig, FileSystemProvider
+
+fs_config = FileSystemConfig(
+    root_path=Path("~/.memorizz").expanduser(),
+    embedding_provider="openai",   # Optional; omit to rely on keyword search
+    embedding_config={"model": "text-embedding-3-small"},
+)
+filesystem_provider = FileSystemProvider(fs_config)
+
+agent = (MemAgentBuilder()
+    .with_instruction("You are a helpful assistant with local memory.")
+    .with_memory_provider(filesystem_provider)
+    .with_llm_config({
+        "provider": "openai",
+        "model": "gpt-4o-mini",
+        "api_key": os.environ["OPENAI_API_KEY"]
+    })
+    .build()
+)
+```
+
+All Oracle/Mongo-specific APIs continue to work—`MemAgent.save()`, semantic cache synchronization, and memagent CRUD now write to the configured directory. Vector search automatically falls back to keyword matching if embeddings or FAISS are not configured.
+
+### 2. Enable Internet Access (Tavily – Preferred)
+
+MemoRizz agents can browse the web by attaching an internet access provider. Tavily is the preferred default: the moment `TAVILY_API_KEY` exists MemoRizz wires up the `TavilyProvider` so Deep Research agents gain the `internet_search` and `open_web_page` tools automatically.
+
+```python
+import os
+from memorizz.internet_access import TavilyProvider
+from memorizz.memagent.builders import MemAgentBuilder
+
+tavily = TavilyProvider(
+    api_key=os.environ["TAVILY_API_KEY"],
+    config={
+        "search_depth": "advanced",
+        "default_max_results": 8,
+        "max_content_chars": 10000,
+    },
+)
+
+agent = (
+    MemAgentBuilder()
+    .with_instruction("Use Tavily to research product feedback.")
+    .with_memory_provider(oracle_provider)
+    .with_llm_config(llm_config)
+    .with_internet_access_provider(tavily)
+    .build()
+)
+
+# Direct helper methods
+news_results = agent.search_internet("Latest AI safety news", max_results=3)
+article = agent.fetch_url("https://openai.com/blog")
+
+# When running the agent, LLMs can call the browsing tools automatically
+response = agent.run("Read the latest AI news and give me two key points.")
+```
+
+> ℹ️ Set `TAVILY_API_KEY` and (optionally) `MEMORIZZ_DEFAULT_INTERNET_PROVIDER=tavily`. MemoRizz automatically uses Tavily whenever the key is present and no other provider is supplied. Responses include `content_truncated` metadata when the `max_content_chars` limit trims an extracted page.
+
+### 3. Enable Internet Access (Firecrawl)
+
+Prefer Firecrawl's hybrid search/crawl pipeline? Swap in the bundled `FirecrawlProvider`.
+
+```python
+import os
+from memorizz.internet_access import FirecrawlProvider
+
+firecrawl = FirecrawlProvider(
+    api_key=os.environ.get("FIRECRAWL_API_KEY"),
+)
+
+agent = (
+    MemAgentBuilder()
+    .with_instruction("Research assistant with access to the live web.")
+    .with_memory_provider(oracle_provider)
+    .with_llm_config({
+        "provider": "openai",
+        "model": "gpt-4o-mini",
+        "api_key": os.environ["OPENAI_API_KEY"]
+    })
+    .with_internet_access_provider(firecrawl)
+    .build()
+)
+```
+
+> ℹ️ Set `FIRECRAWL_API_KEY` in the environment (or pass `api_key=` explicitly). Optional kwargs such as `base_url` and `timeout` can also be provided when instantiating `FirecrawlProvider`.
+>
+> ⚠️ Browsing APIs return the entire page body, which can overflow an LLM's context window. The `FirecrawlProvider` trims markdown content to 16,000 characters by default and annotates the response with `content_truncated` metadata. Adjust this behavior by passing a config dict (e.g., `max_content_chars`, `include_raw_response`, `max_raw_chars`) to keep scraped pages small enough for downstream prompts.
+
+## Context Window Usage Tracking
+
+MemoRizz agents now surface their token budget consumption so you can keep an eye on the active context window while the agent works.
+
+- **Automatic logging**: Every LLM call records a line such as `Context window usage (iteration_1): 2150/128000 tokens (1.68%) | prompt=2100 completion=50` at `INFO` level.
+- **Programmatic access**: Call `memagent.get_context_window_stats()` after any turn to retrieve the most recent snapshot (prompt/completion/total tokens, configured window size, percentage used, and timestamp).
+- **Configurable budgets**: Provide `context_window_tokens=...` when constructing the agent (or inside `llm_config`) to override the detected window for custom models.
+
+```python
+response = agent.run("Summarize the last project update I gave you yesterday.")
+
+stats = agent.get_context_window_stats()
+print(
+    f"Used {stats['total_tokens']} tokens (~{stats['percentage_used']:.2f}% of window)"
+)
+```
+
+When no explicit window is supplied, MemoRizz attempts to infer it from the underlying provider (OpenAI, Azure, or Hugging Face). The stats object is safe to store or expose via telemetry dashboards for proactive monitoring.
+
+📘 See the full walkthrough in `docs/utilities/context_window_stats.md`.
+
+## Documentation
+
+All project documentation lives in the root-level `docs/` directory and is rendered with [MkDocs Material](https://squidfunk.github.io/mkdocs-material/).
+
+### Local preview
+
+```bash
+pip install -e ".[docs]"
+make docs-serve            # or: mkdocs serve
+```
+
+Open <http://localhost:8000> to view the live site. Use `make docs-build` before committing to ensure the site compiles without warnings.
+
+### Deployment
+
+1. Push changes to `main`. The `Docs` GitHub Action builds the site with `mkdocs build --strict` and uploads it to the `gh-pages` branch.
+2. In the repository Settings → Pages panel, select **GitHub Actions** as the source (one-time setup).
+3. If you ever need a manual publish, run `mkdocs gh-deploy --force` from your local machine (it uses the same `gh-pages` branch).
+
+Every time you edit a Markdown file or docstring referenced via `mkdocstrings`, the GitHub Action republishes the updated site automatically.
 
 # Table of single agent and multi-agent setups, their descriptions, and links to example notebooks
 | Agent Type                | Description                                                                 | Example Notebook                                                                 |

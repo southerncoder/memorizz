@@ -67,6 +67,7 @@ class TestMemAgentCore:
         assert hasattr(agent, "cache_manager")
         assert hasattr(agent, "persona_manager")
         assert hasattr(agent, "workflow_manager")
+        assert hasattr(agent, "internet_access_manager")
 
         # Check memory manager
         assert agent.memory_manager is not None
@@ -80,6 +81,8 @@ class TestMemAgentCore:
         assert agent.tool_manager is not None
         assert agent.persona_manager is not None
         assert agent.workflow_manager is not None
+        assert agent.internet_access_manager is not None
+        assert agent.internet_access_manager.is_enabled() is False
 
     @pytest.mark.unit
     def test_memagent_without_memory_provider(self):
@@ -125,6 +128,49 @@ class TestMemAgentCore:
         assert agent.persona_manager is not None
         # The persona should be set in the persona manager
         # Note: Detailed persona testing is in test_persona_manager.py
+
+    @pytest.mark.unit
+    def test_with_entity_memory_toggle(self, mock_memory_provider):
+        """Ensure with_entity_memory toggles tools and state."""
+        agent = MemAgent(
+            instruction="Entity toggle", memory_provider=mock_memory_provider
+        )
+
+        assert agent._entity_memory_enabled is False
+        agent.with_entity_memory(True)
+        assert agent._entity_memory_enabled is True
+        assert "entity_memory_lookup" in agent.tool_manager.tools
+
+        agent.with_entity_memory(False)
+        assert agent._entity_memory_enabled is False
+        assert "entity_memory_lookup" not in agent.tool_manager.tools
+
+    @pytest.mark.unit
+    def test_assistant_mode_enables_entity_memory(self, mock_memory_provider):
+        """Assistant mode should activate entity memory by default."""
+        agent = MemAgent(
+            instruction="Assistant with entity memory",
+            memory_provider=mock_memory_provider,
+            application_mode="assistant",
+        )
+
+        assert agent._entity_memory_enabled is True
+        assert "entity_memory_lookup" in agent.tool_manager.tools
+
+    @pytest.mark.unit
+    def test_builder_entity_memory_toggle(self, mock_memory_provider):
+        """Builder helper should pass through entity memory preference."""
+        from memorizz.memagent.builders import MemAgentBuilder
+
+        builder = (
+            MemAgentBuilder()
+            .with_instruction("Test builder entity memory")
+            .with_memory_provider(mock_memory_provider)
+            .with_entity_memory(True)
+        )
+        agent = builder.build()
+
+        assert agent._entity_memory_enabled is True
 
 
 class TestMemAgentRun:

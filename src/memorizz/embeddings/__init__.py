@@ -13,6 +13,7 @@ class EmbeddingProvider(Enum):
     OLLAMA = "ollama"
     VOYAGEAI = "voyageai"
     AZURE = "azure"
+    HUGGINGFACE = "huggingface"
 
 
 class BaseEmbeddingProvider(ABC):
@@ -119,6 +120,10 @@ class EmbeddingManager:
             from .voyageai import VoyageAIEmbeddingProvider
 
             return VoyageAIEmbeddingProvider(self.config)
+        elif self.provider_type == EmbeddingProvider.HUGGINGFACE:
+            from .huggingface import HuggingFaceEmbeddingProvider
+
+            return HuggingFaceEmbeddingProvider(self.config)
         else:
             raise ValueError(f"Provider {self.provider_type} not implemented")
 
@@ -169,6 +174,22 @@ class EmbeddingManager:
 _global_embedding_manager: Optional[EmbeddingManager] = None
 
 
+def set_global_embedding_manager(manager: EmbeddingManager) -> EmbeddingManager:
+    """
+    Set the global embedding manager.
+
+    This allows custom providers (e.g., Oracle/Mongo builders) to keep the
+    module-level helpers in sync with the configured provider.
+    """
+    global _global_embedding_manager
+    _global_embedding_manager = manager
+    logger.info(
+        "Set global embedding provider: %s",
+        manager.get_provider_info(),
+    )
+    return manager
+
+
 def configure_embeddings(
     provider: Union[str, EmbeddingProvider] = EmbeddingProvider.OPENAI,
     config: Optional[Dict[str, Any]] = None,
@@ -188,12 +209,8 @@ def configure_embeddings(
     EmbeddingManager
         The configured embedding manager
     """
-    global _global_embedding_manager
-    _global_embedding_manager = EmbeddingManager(provider, config)
-    logger.info(
-        f"Configured global embedding provider: {_global_embedding_manager.get_provider_info()}"
-    )
-    return _global_embedding_manager
+    manager = EmbeddingManager(provider, config)
+    return set_global_embedding_manager(manager)
 
 
 def get_embedding_manager() -> EmbeddingManager:
@@ -363,6 +380,36 @@ def infer_embedding_dimensions(
                 f"Unknown VoyageAI model {model}, defaulting to 1024 dimensions"
             )
             return 1024
+
+    # Hugging Face provider
+    elif provider_str == "huggingface":
+        from .huggingface.provider import HuggingFaceEmbeddingProvider
+
+        if config and "dimensions" in config:
+            dimensions = config["dimensions"]
+            logger.debug(
+                "Inferred dimensions from config: %s (provider: %s, model: %s)",
+                dimensions,
+                provider_str,
+                model,
+            )
+            return dimensions
+
+        dims = HuggingFaceEmbeddingProvider.MODEL_DIMENSIONS.get(model)
+        if dims:
+            logger.debug(
+                "Inferred dimensions from model metadata: %s (provider: %s, model: %s)",
+                dims,
+                provider_str,
+                model,
+            )
+            return dims
+        else:
+            logger.warning(
+                "Unknown Hugging Face embedding model %s. Defaulting to 768 dimensions.",
+                model,
+            )
+            return 768
 
     # Unknown provider - try to get from global config or raise
     else:

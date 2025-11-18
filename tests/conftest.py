@@ -7,8 +7,38 @@ from unittest.mock import MagicMock, Mock
 
 import pytest
 
+# Ensure third-party clients that expect OpenAI credentials during tests do not fail.
+os.environ.setdefault("OPENAI_API_KEY", "test-api-key")
+
 # Add src to path for testing
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(__file__)), "src"))
+
+
+# Provide a deterministic embedding implementation for tests to avoid network calls.
+from memorizz import embeddings as _embeddings  # noqa: E402
+
+
+def _test_embedding(_text: str, **kwargs):
+    """Return a stub embedding vector for test isolation."""
+    return [0.0]
+
+
+class _TestEmbeddingManager:
+    def get_embedding(self, text: str, **kwargs):
+        return _test_embedding(text, **kwargs)
+
+    def get_dimensions(self) -> int:
+        return 1
+
+    def get_default_model(self) -> str:
+        return "test-stub"
+
+    def get_provider_info(self):
+        return {"provider": "test", "model": "test-stub", "dimensions": 1}
+
+
+_embeddings.get_embedding = _test_embedding
+_embeddings.get_embedding_manager = lambda: _TestEmbeddingManager()  # type: ignore
 
 
 # =============================================================================
@@ -30,6 +60,8 @@ def mock_llm_provider():
 def mock_memory_provider():
     """Mock memory provider for testing."""
     mock_memory = Mock()
+    mock_memory.supports_entity_memory.return_value = True
+    mock_memory.entity_memory_collection = True
 
     # Mock memory storage
     mock_memory._storage = {}
@@ -150,6 +182,11 @@ def memagent_with_mocks(
         max_steps=15,
         semantic_cache=False,
     )
+
+    # Wrap load_conversation_history so tests can assert call counts.
+    if agent.memory_manager:
+        original = agent.memory_manager.load_conversation_history
+        agent.memory_manager.load_conversation_history = MagicMock(wraps=original)
 
     return agent
 

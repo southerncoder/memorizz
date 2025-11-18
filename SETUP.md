@@ -44,6 +44,8 @@ pip install oracledb
 pip install openai
 ```
 
+> **Hugging Face support:** Sentence Transformers + Transformers + Accelerate are bundled with the base `memorizz` wheel, so no extra install command is required before selecting `embedding_provider="huggingface"` or the Hugging Face LLM provider.
+
 ### API Keys
 
 - **OpenAI API Key** - Required for embeddings and LLM functionality

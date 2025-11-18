@@ -85,6 +85,7 @@ class MongoDBProvider(MemoryProvider):
             MemoryType.CONVERSATION_MEMORY.value
         ]
         self.workflow_memory_collection = self.db[MemoryType.WORKFLOW_MEMORY.value]
+        self.entity_memory_collection = self.db[MemoryType.ENTITY_MEMORY.value]
         self.memagent_collection = self.db[MemoryType.MEMAGENT.value]
         self.shared_memory_collection = self.db[MemoryType.SHARED_MEMORY.value]
         self.summaries_collection = self.db[MemoryType.SUMMARIES.value]
@@ -362,6 +363,8 @@ class MongoDBProvider(MemoryProvider):
             collection = self.summaries_collection
         elif memory_store_type == MemoryType.SEMANTIC_CACHE:
             collection = self.semantic_cache_collection
+        elif memory_store_type == MemoryType.ENTITY_MEMORY:
+            collection = self.entity_memory_collection
 
         if collection is None:
             raise ValueError(f"Invalid memory store type: {memory_store_type}")
@@ -397,6 +400,9 @@ class MongoDBProvider(MemoryProvider):
         elif memory_store_type == MemoryType.CONVERSATION_MEMORY:
             # Don't remove memory_id for conversation memory as it's needed for conversation history retrieval
             pass  # Keep memory_id for conversation memory
+        elif memory_store_type == MemoryType.ENTITY_MEMORY:
+            # Entity memory relies on memory_id for scoping
+            pass
         else:
             # For all other memory types, remove memory_id as before
             custom_id_fields.append("memory_id")
@@ -488,6 +494,10 @@ class MongoDBProvider(MemoryProvider):
             return self.conversation_memory_collection.find(query, projection).limit(
                 limit
             )
+        elif memory_store_type == MemoryType.ENTITY_MEMORY:
+            return self.retrieve_entity_memory_records(
+                query, limit, include_embedding=include_embedding, **kwargs
+            )
         elif memory_store_type == MemoryType.SUMMARIES:
             return self.retrieve_summaries_by_query(query, limit)
         elif memory_store_type == MemoryType.SEMANTIC_CACHE:
@@ -532,6 +542,7 @@ class MongoDBProvider(MemoryProvider):
             MemoryType.SHARED_MEMORY: self.shared_memory_collection,
             MemoryType.SUMMARIES: self.summaries_collection,
             MemoryType.SEMANTIC_CACHE: self.semantic_cache_collection,
+            MemoryType.ENTITY_MEMORY: self.entity_memory_collection,
         }
 
         collection = collection_mapping.get(memory_store_type)
@@ -605,6 +616,8 @@ class MongoDBProvider(MemoryProvider):
             )
         elif memory_store_type == MemoryType.SUMMARIES:
             return self.summaries_collection.find_one({"name": name}, projection)
+        elif memory_store_type == MemoryType.ENTITY_MEMORY:
+            return self.entity_memory_collection.find_one({"name": name}, projection)
 
     def retrieve_persona_by_query(
         self, query: Dict[str, Any], limit: int = 1
@@ -707,6 +720,68 @@ class MongoDBProvider(MemoryProvider):
 
         # Return the results
         return results if results else None
+
+    def retrieve_entity_memory_records(
+        self,
+        query: Union[Dict[str, Any], str],
+        limit: int = 5,
+        include_embedding: bool = False,
+        **kwargs,
+    ):
+        """
+        Retrieve entity memory records using a filter or semantic query.
+        """
+
+        if isinstance(query, dict):
+            projection = {} if include_embedding else {"embedding": 0}
+            return self.entity_memory_collection.find(query, projection).limit(limit)
+
+        try:
+            embedding = get_embedding(query)
+        except Exception as e:
+            logger.error(f"Failed to generate embedding for entity query: {e}")
+            return []
+
+        search_filter = {}
+        memory_id = kwargs.get("memory_id")
+        if memory_id is not None:
+            search_filter["memory_id"] = str(memory_id)
+
+        vector_stage: Dict[str, Any] = {
+            "$vectorSearch": {
+                "queryVector": embedding,
+                "path": "embedding",
+                "numCandidates": 100,
+                "limit": limit,
+                "index": "vector_index",
+            }
+        }
+        if search_filter:
+            vector_stage["$vectorSearch"]["filter"] = search_filter
+
+        project_stage = {
+            "$project": {
+                "_id": 1,
+                "entity_id": 1,
+                "name": 1,
+                "entity_type": 1,
+                "attributes": 1,
+                "relations": 1,
+                "metadata": 1,
+                "memory_id": 1,
+                "created_at": 1,
+                "updated_at": 1,
+                "embedding": 0,
+                "score": {"$meta": "vectorSearchScore"},
+            }
+        }
+
+        pipeline = [vector_stage, project_stage]
+        try:
+            return list(self.entity_memory_collection.aggregate(pipeline))
+        except Exception as e:
+            logger.warning(f"Vector search failed for entity memory: {e}")
+            return []
 
     def retrieve_workflow_by_query(
         self, query: Dict[str, Any], limit: int = 1
@@ -1098,6 +1173,7 @@ class MongoDBProvider(MemoryProvider):
             MemoryType.SHARED_MEMORY: self.shared_memory_collection,
             MemoryType.SUMMARIES: self.summaries_collection,
             MemoryType.SEMANTIC_CACHE: self.semantic_cache_collection,
+            MemoryType.ENTITY_MEMORY: self.entity_memory_collection,
         }
 
         collection = collection_mapping.get(memory_store_type)
@@ -1144,6 +1220,8 @@ class MongoDBProvider(MemoryProvider):
             result = self.workflow_memory_collection.delete_one({"name": name})
         elif memory_store_type == MemoryType.SUMMARIES:
             result = self.summaries_collection.delete_one({"name": name})
+        elif memory_store_type == MemoryType.ENTITY_MEMORY:
+            result = self.entity_memory_collection.delete_one({"name": name})
         else:
             return False
 
@@ -1177,6 +1255,8 @@ class MongoDBProvider(MemoryProvider):
             result = self.workflow_memory_collection.delete_many({})
         elif memory_store_type == MemoryType.SUMMARIES:
             result = self.summaries_collection.delete_many({})
+        elif memory_store_type == MemoryType.ENTITY_MEMORY:
+            result = self.entity_memory_collection.delete_many({})
         else:
             return False
 
@@ -1219,6 +1299,8 @@ class MongoDBProvider(MemoryProvider):
             return list(self.shared_memory_collection.find({}, projection))
         elif memory_store_type == MemoryType.SUMMARIES:
             return list(self.summaries_collection.find({}, projection))
+        elif memory_store_type == MemoryType.ENTITY_MEMORY:
+            return list(self.entity_memory_collection.find({}, projection))
         else:
             logger.warning(
                 f"Unsupported memory store type for list_all: {memory_store_type}"
@@ -1256,6 +1338,7 @@ class MongoDBProvider(MemoryProvider):
             MemoryType.SHARED_MEMORY: self.shared_memory_collection,
             MemoryType.SUMMARIES: self.summaries_collection,
             MemoryType.SEMANTIC_CACHE: self.semantic_cache_collection,
+            MemoryType.ENTITY_MEMORY: self.entity_memory_collection,
         }
 
         collection = collection_mapping.get(memory_store_type)
@@ -1782,6 +1865,10 @@ class MongoDBProvider(MemoryProvider):
             agents.append(agent)
 
         return agents
+
+    def supports_entity_memory(self) -> bool:
+        """MongoDB provider supports entity memory operations."""
+        return True
 
     def update_memagent_memory_ids(self, agent_id: str, memory_ids: List[str]) -> bool:
         """

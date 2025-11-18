@@ -32,6 +32,7 @@ Use semantic memory when you need to:
 - **Vector search**: Leverage embeddings for similarity-based knowledge discovery
 - **Namespace organization**: Categorize knowledge by domains or topics
 - **Memory scoping**: Attach knowledge bases to specific agents or sessions
+- **Entity memory**: Maintain structured profiles (attribute–value pairs and relations) for people, organizations, and other key entities
 
 ## Usage
 
@@ -52,11 +53,11 @@ kb = KnowledgeBase(memory_provider)
 
 # Ingest knowledge into the semantic memory
 knowledge_text = """
-Artificial Intelligence (AI) is a branch of computer science that aims to create 
-intelligent machines capable of performing tasks that typically require human 
+Artificial Intelligence (AI) is a branch of computer science that aims to create
+intelligent machines capable of performing tasks that typically require human
 intelligence. AI systems can learn, reason, perceive, and make decisions.
 
-Machine Learning is a subset of AI that enables computers to learn and improve 
+Machine Learning is a subset of AI that enables computers to learn and improve
 from experience without being explicitly programmed for every task.
 """
 
@@ -90,9 +91,9 @@ legal_kb = KnowledgeBase(memory_provider)
 
 # Ingest medical knowledge
 medical_text = """
-Hypertension, also known as high blood pressure, is a condition where blood 
-pressure in the arteries is persistently elevated. Normal blood pressure is 
-typically below 120/80 mmHg. Hypertension is diagnosed when readings consistently 
+Hypertension, also known as high blood pressure, is a condition where blood
+pressure in the arteries is persistently elevated. Normal blood pressure is
+typically below 120/80 mmHg. Hypertension is diagnosed when readings consistently
 exceed 140/90 mmHg.
 """
 
@@ -103,9 +104,9 @@ medical_ltm_id = medical_kb.ingest_knowledge(
 
 # Ingest legal knowledge
 legal_text = """
-Contract law governs the formation and enforcement of agreements between parties. 
-A valid contract requires offer, acceptance, consideration, and mutual intention 
-to create legal relations. Breach of contract occurs when one party fails to 
+Contract law governs the formation and enforcement of agreements between parties.
+A valid contract requires offer, acceptance, consideration, and mutual intention
+to create legal relations. Breach of contract occurs when one party fails to
 perform their contractual obligations.
 """
 
@@ -147,8 +148,8 @@ agent.long_term_memory_id = ltm_id  # Links agent to specific knowledge corpus
 # Option 2: Create agent-specific knowledge base
 agent_kb = KnowledgeBase(memory_provider)
 domain_knowledge = """
-Customer service best practices include active listening, empathy, 
-clear communication, and problem-solving focus. Always acknowledge 
+Customer service best practices include active listening, empathy,
+clear communication, and problem-solving focus. Always acknowledge
 the customer's concern and work towards a satisfactory resolution.
 """
 
@@ -157,6 +158,17 @@ agent_ltm_id = agent_kb.ingest_knowledge(
     namespace="customer_service"
 )
 agent.long_term_memory_id = agent_ltm_id
+
+## Entity Memory
+
+Structured, entity-centric facts live under `long_term_memory/semantic/entity_memory/`.
+The module exposes an `EntityMemory` class for recording attributes (e.g., preferred
+language, account tier, device type) and associative relations, plus helper methods for
+semantic lookup. MemAgent wires these capabilities through the new
+`EntityMemoryManager`, enabling LLMs to call `entity_memory_lookup` /
+`entity_memory_upsert` tools to retrieve or update entity profiles mid-conversation.
+
+See `entity_memory/README.md` for the standalone usage guide.
 
 # The agent can now access this knowledge during conversations
 response = agent.run("What are some customer service best practices?")

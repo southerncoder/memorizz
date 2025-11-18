@@ -1,4 +1,4 @@
-.PHONY: help install lint format check test clean
+.PHONY: help install lint format check test clean docs-serve docs-build
 
 help:
 	@echo "Memorizz Development Commands:"
@@ -8,6 +8,8 @@ help:
 	@echo "  make format         Format code with black and isort"
 	@echo "  make check          Run lint + format check (pre-commit)"
 	@echo "  make test           Run tests"
+	@echo "  make docs-serve     Launch mkdocs with hot reload"
+	@echo "  make docs-build     Build the static documentation site"
 	@echo "  make clean          Clean up generated files"
 	@echo ""
 
@@ -47,3 +49,9 @@ clean:
 	find . -type f -name "*.pyo" -delete
 	find . -type d -name "*.egg-info" -exec rm -rf {} + 2>/dev/null || true
 	find . -type d -name ".pytest_cache" -exec rm -rf {} + 2>/dev/null || true
+
+docs-serve:
+	mkdocs serve
+
+docs-build:
+	mkdocs build --strict

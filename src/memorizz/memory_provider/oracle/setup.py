@@ -21,6 +21,24 @@ except ImportError:
     oracledb = None
 
 
+def _safe_close_connection(conn):
+    """
+    Safely close a database connection, handling cases where it's already closed.
+
+    Args:
+        conn: Oracle database connection object (or None)
+    """
+    if conn is None:
+        return
+
+    try:
+        conn.close()
+    except Exception:
+        # Connection is already closed or doesn't exist, ignore the error
+        # This handles oracledb.exceptions.InterfaceError and any other exceptions
+        pass
+
+
 def parse_sql_file(filepath):
     """Parse SQL file into individual executable statements."""
     with open(filepath, "r") as f:
@@ -394,7 +412,7 @@ def _create_user_and_grant_privileges(
                 except Exception:
                     print("  Reconnecting to database...")
                     admin_cursor.close()
-                    admin_conn.close()
+                    _safe_close_connection(admin_conn)
                     # Reconnect with proper admin user (could be sys as sysdba)
                     reconnect_admin_user = admin_user or os.environ.get(
                         "ORACLE_ADMIN_USER", "system"
@@ -983,8 +1001,7 @@ def setup_oracle_user():
 
             if can_connect_sys and sys_capabilities.get("can_create_users", False):
                 # Close SYSTEM connection and use SYS
-                if admin_conn:
-                    admin_conn.close()
+                _safe_close_connection(admin_conn)
                 admin_conn = sys_conn
                 admin_capabilities = sys_capabilities
                 active_admin_user = "sys"  # Update for display
@@ -1077,8 +1094,7 @@ def setup_oracle_user():
                 print("  4. User credentials are valid for the database")
                 print("  5. Database service is running and accessible")
 
-            if admin_conn:
-                admin_conn.close()
+            _safe_close_connection(admin_conn)
             return False
 
     print()
@@ -1093,10 +1109,10 @@ def setup_oracle_user():
         )
 
         if not success:
-            admin_conn.close()
+            _safe_close_connection(admin_conn)
             return False
 
-        admin_conn.close()
+        _safe_close_connection(admin_conn)
         print()
 
     # ========== STEP 2: Create Schema ==========

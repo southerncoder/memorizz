@@ -27,6 +27,7 @@ class AzureOpenAI(LLMProvider):
         azure_endpoint: Optional[str] = None,
         api_version: Optional[str] = None,
         deployment_name: str = "gpt-4o",
+        context_window_tokens: Optional[int] = None,
     ):
         """
         Initialize the Azure OpenAI client.
@@ -58,6 +59,8 @@ class AzureOpenAI(LLMProvider):
         )
         # In Azure, the 'model' is the deployment name.
         self.model = deployment_name
+        self.context_window_tokens = context_window_tokens or 128_000
+        self._last_usage: Optional[Dict[str, int]] = None
 
     def get_config(self) -> Dict[str, Any]:
         """Returns a serializable configuration for the AzureOpenAI provider."""
@@ -202,6 +205,7 @@ class AzureOpenAI(LLMProvider):
             kwargs["tool_choice"] = tool_choice
 
         response = self.client.chat.completions.create(**kwargs)
+        self._last_usage = self._extract_usage(response)
 
         # If there are tool calls, return the full response object
         if response.choices[0].message.tool_calls:
@@ -209,3 +213,22 @@ class AzureOpenAI(LLMProvider):
 
         # Otherwise return just the text content
         return response.choices[0].message.content
+
+    def _extract_usage(self, response: Any) -> Optional[Dict[str, int]]:
+        usage = getattr(response, "usage", None)
+        if not usage:
+            return None
+        try:
+            return {
+                "prompt_tokens": getattr(usage, "prompt_tokens", None),
+                "completion_tokens": getattr(usage, "completion_tokens", None),
+                "total_tokens": getattr(usage, "total_tokens", None),
+            }
+        except Exception:
+            return None
+
+    def get_last_usage(self) -> Optional[Dict[str, int]]:
+        return self._last_usage
+
+    def get_context_window_tokens(self) -> Optional[int]:
+        return self.context_window_tokens

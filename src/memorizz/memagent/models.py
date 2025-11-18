@@ -30,6 +30,9 @@ class MemAgentModel(BaseModel):
     semantic_cache_config: Optional[
         Union[Any, Dict[str, Any]]
     ] = None  # Semantic cache configuration
+    context_window_tokens: Optional[int] = None
+    internet_access_provider: Optional[str] = None
+    internet_access_config: Optional[Dict[str, Any]] = None
 
     model_config = {
         "arbitrary_types_allowed": True  # Allow arbitrary types like Toolbox

@@ -182,6 +182,7 @@ class MultiAgentOrchestrator:
                 content={"sub_tasks": [task.to_dict() for task in sub_tasks]},
                 entry_type="task_decomposition",
             )
+            self._after_task_decomposition(sub_tasks, user_query)
 
             # 3. Execute sub-tasks in parallel
             logger.info(f"Executing {len(sub_tasks)} sub-tasks in parallel...")
@@ -300,6 +301,7 @@ class MultiAgentOrchestrator:
                             content={"task_id": task.task_id, "result": result},
                             entry_type="task_completion",
                         )
+                        self._after_task_completion(task, result)
 
                     except Exception as e:
                         logger.error(f"Error executing task {task.task_id}: {e}")
@@ -521,3 +523,14 @@ class MultiAgentOrchestrator:
             logger.error(f"Error in enhanced task decomposition: {e}")
             # Fallback to standard decomposition
             return self.task_decomposer.decompose_task(user_query, self.delegates)
+
+    # Hook methods for specialized orchestrators ---------------------------------
+    def _after_task_decomposition(
+        self, sub_tasks: List[SubTask], user_query: str
+    ) -> None:
+        """Optional hook for subclasses after decomposition."""
+        return
+
+    def _after_task_completion(self, task: SubTask, result: Any) -> None:
+        """Optional hook after individual task completion."""
+        return

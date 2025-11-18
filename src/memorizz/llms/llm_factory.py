@@ -3,6 +3,7 @@
 from typing import Any, Dict
 
 from .azure import AzureOpenAI
+from .huggingface import HuggingFaceLLM
 from .llm_provider import LLMProvider
 from .openai import OpenAI
 
@@ -45,9 +46,10 @@ def create_llm_provider(config: Dict[str, Any]) -> LLMProvider:
             deployment_name=azure_config.get("deployment_name"),
         )
 
-    # To extend, add more providers here:
-    # elif provider_name == "anthropic":
-    #     ...
+    elif provider_name == "huggingface":
+        huggingface_config = config.copy()
+        huggingface_config.pop("provider", None)
+        return HuggingFaceLLM(**huggingface_config)
 
     else:
         raise ValueError(f"Unknown LLM provider: '{provider_name}'")

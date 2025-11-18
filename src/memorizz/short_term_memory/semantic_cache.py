@@ -171,7 +171,11 @@ class SemanticCache:
 
         # Check if this is a known provider with vector search support
         provider_class_name = self.memory_provider.__class__.__name__
-        if provider_class_name in ("MongoDBProvider", "OracleProvider"):
+        if provider_class_name in (
+            "MongoDBProvider",
+            "OracleProvider",
+            "FileSystemProvider",
+        ):
             return True
 
         # For other providers, check if they have vector search capability

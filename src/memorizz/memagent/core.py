@@ -1,18 +1,25 @@
+import json
 import logging
 import uuid
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Set, Tuple, Union
 
-from ..enums import MemoryType, Role
+from ..enums import ApplicationMode, ApplicationModeConfig, MemoryType, Role
+from ..internet_access import get_default_internet_access_provider
 from ..llms.llm_factory import create_llm_provider
 from .constants import DEFAULT_INSTRUCTION, DEFAULT_MAX_STEPS, DEFAULT_TOOL_ACCESS
 from .managers import (
     CacheManager,
+    EntityMemoryManager,
+    InternetAccessManager,
     MemoryManager,
     PersonaManager,
     ToolManager,
     WorkflowManager,
 )
+
+if TYPE_CHECKING:
+    from ..internet_access import InternetAccessProvider
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +50,8 @@ class MemAgent:
         embedding_config: Optional[Dict[str, Any]] = None,
         semantic_cache: bool = False,
         semantic_cache_config: Optional[Union[Any, Dict[str, Any]]] = None,
+        context_window_tokens: Optional[int] = None,
+        internet_access_provider: Optional["InternetAccessProvider"] = None,
     ):
         """Initialize the MemAgent with configuration."""
         # Store configuration
@@ -57,15 +66,23 @@ class MemAgent:
             if memory_ids
             else []
         )
+        self.tools = tools if tools is not None else []
+
+        (
+            self.application_mode,
+            self._application_mode_explicit,
+        ) = self._resolve_application_mode(application_mode)
 
         # Store memory types for tracking which memory systems are active
         self.active_memory_types = self._initialize_memory_types(
-            application_mode, memory_types
+            self.application_mode if self._application_mode_explicit else None,
+            memory_types,
         )
 
         # Initialize conversation state tracking
         self._current_conversation_id = None
         self._current_memory_id = None
+        self._last_entity_context: List[Dict[str, Any]] = []
 
         # Initialize LLM
         self.model = model
@@ -75,6 +92,29 @@ class MemAgent:
             except Exception as e:
                 logger.warning(f"Could not create LLM from config: {e}")
 
+        self._context_window_tokens = self._initialize_context_window_tokens(
+            context_window_tokens, llm_config
+        )
+        self._last_context_window_stats: Optional[Dict[str, Any]] = None
+
+        # Track entity memory state before manager initialization
+        self._entity_memory_enabled = False
+        self._entity_memory_tools_registered = False
+        self._entity_memory_tool_names = (
+            "entity_memory_lookup",
+            "entity_memory_upsert",
+        )
+        self._internet_access_tools_registered = False
+        self._internet_access_tool_names = ("internet_search", "open_web_page")
+        self._context_tools_registered = False
+        self._summary_registry: List[Dict[str, Any]] = []
+        self._known_summary_ids: Set[str] = set()
+        self._context_summary_trigger = 85.0
+        self._context_summary_cooldown = 90.0
+        self._last_summary_timestamp = 0.0
+        self._internet_access_failure_count = 0
+        self._internet_access_disabled_reason: Optional[str] = None
+
         # Initialize manager components
         self._initialize_managers(
             memory_provider=memory_provider,
@@ -82,7 +122,29 @@ class MemAgent:
             semantic_cache_config=semantic_cache_config,
             embedding_provider=embedding_provider,
             embedding_config=embedding_config,
+            internet_access_provider=internet_access_provider,
         )
+        self._register_context_monitor_tools()
+
+        provider_to_attach = internet_access_provider
+        if (
+            not provider_to_attach
+            and self.application_mode == ApplicationMode.DEEP_RESEARCH
+        ):
+            try:
+                provider_to_attach = get_default_internet_access_provider()
+            except Exception as exc:  # pragma: no cover - defensive
+                logger.warning(
+                    "Failed to initialize default internet provider: %s", exc
+                )
+                provider_to_attach = None
+
+        if provider_to_attach:
+            self.with_internet_access_provider(provider_to_attach)
+
+        # Enable entity memory automatically if configured via application mode
+        if MemoryType.ENTITY_MEMORY in self.active_memory_types:
+            self.with_entity_memory(True)
 
         # Initialize tools if provided
         if tools:
@@ -95,6 +157,18 @@ class MemAgent:
         logger.info(
             f"MemAgent {self.agent_id} initialized with memory types: {self.active_memory_types}"
         )
+
+    def _resolve_application_mode(
+        self, application_mode: Optional[Union[str, ApplicationMode]]
+    ) -> Tuple[ApplicationMode, bool]:
+        """Resolve and validate application mode, returning (mode, was_explicit)."""
+        if application_mode is not None:
+            try:
+                mode = ApplicationModeConfig.validate_mode(application_mode)
+                return mode, True
+            except ValueError:
+                logger.warning(f"Invalid application mode: {application_mode}")
+        return ApplicationMode.DEFAULT, False
 
     def _initialize_memory_types(self, application_mode, memory_types):
         """Initialize active memory types based on application mode or explicit memory_types."""
@@ -114,6 +188,17 @@ class MemAgent:
                 return result
             return memory_types
 
+        if application_mode:
+            try:
+                mode = (
+                    application_mode
+                    if isinstance(application_mode, ApplicationMode)
+                    else ApplicationModeConfig.validate_mode(application_mode)
+                )
+                return ApplicationModeConfig.get_memory_types(mode)
+            except ValueError:
+                logger.warning(f"Invalid application mode: {application_mode}")
+
         # Otherwise, derive from application_mode or use defaults
         # Default: conversation + workflow memory for most agents
         return [MemoryType.CONVERSATION_MEMORY, MemoryType.WORKFLOW_MEMORY]
@@ -125,6 +210,7 @@ class MemAgent:
         semantic_cache_config=None,
         embedding_provider=None,
         embedding_config=None,
+        internet_access_provider=None,
     ):
         """Initialize all manager components."""
         # Memory Manager
@@ -133,6 +219,12 @@ class MemAgent:
         else:
             self.memory_manager = None
             logger.warning("No memory provider - memory functionality disabled")
+
+        # Entity Memory Manager
+        if memory_provider:
+            self.entity_memory_manager = EntityMemoryManager(memory_provider)
+        else:
+            self.entity_memory_manager = None
 
         # Tool Manager
         self.tool_manager = ToolManager(memory_provider)
@@ -152,6 +244,190 @@ class MemAgent:
         # Workflow Manager
         self.workflow_manager = WorkflowManager()
 
+        # Internet Access Manager
+        self.internet_access_manager = InternetAccessManager(internet_access_provider)
+
+    def _initialize_context_window_tokens(
+        self, explicit_value: Optional[int], llm_config: Optional[Dict[str, Any]]
+    ) -> Optional[int]:
+        """Configure the context window token budget from overrides/config/provider."""
+        if explicit_value and explicit_value > 0:
+            return explicit_value
+
+        config_value = self._extract_context_window_from_config(llm_config)
+        if config_value:
+            return config_value
+
+        return self._get_model_context_window()
+
+    def _extract_context_window_from_config(
+        self, llm_config: Optional[Dict[str, Any]]
+    ) -> Optional[int]:
+        if not llm_config:
+            return None
+        for key in ("context_window_tokens", "max_context_tokens", "context_window"):
+            value = llm_config.get(key)
+            if isinstance(value, (int, float)) and value > 0:
+                return int(value)
+        return None
+
+    def _get_model_context_window(self) -> Optional[int]:
+        if self.model and hasattr(self.model, "get_context_window_tokens"):
+            try:
+                value = self.model.get_context_window_tokens()
+                if value and value > 0:
+                    return value
+            except Exception as exc:
+                logger.debug(f"Could not read context window from provider: {exc}")
+        return None
+
+    def _get_last_model_usage(self) -> Optional[Dict[str, int]]:
+        if self.model and hasattr(self.model, "get_last_usage"):
+            try:
+                return self.model.get_last_usage()
+            except Exception as exc:
+                logger.debug(f"Could not access provider usage stats: {exc}")
+        return None
+
+    def _record_context_window_usage(self, stage: str) -> None:
+        usage = self._get_last_model_usage()
+        if not usage:
+            return
+
+        prompt_tokens = usage.get("prompt_tokens") if isinstance(usage, dict) else None
+        completion_tokens = (
+            usage.get("completion_tokens") if isinstance(usage, dict) else None
+        )
+        total_tokens = usage.get("total_tokens") if isinstance(usage, dict) else None
+
+        if total_tokens is None:
+            total_tokens = (prompt_tokens or 0) + (completion_tokens or 0)
+
+        context_window = self._context_window_tokens
+        percentage_used = (
+            (total_tokens / context_window) * 100
+            if context_window and total_tokens is not None and context_window > 0
+            else None
+        )
+
+        stats = {
+            "timestamp": datetime.now().isoformat(),
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "total_tokens": total_tokens,
+            "context_window_tokens": context_window,
+            "percentage_used": percentage_used,
+            "stage": stage,
+        }
+
+        self._last_context_window_stats = stats
+        self._maybe_generate_context_summary()
+
+        if context_window and percentage_used is not None:
+            logger.info(
+                "Context window usage (%s): %s/%s tokens (%.2f%%) | prompt=%s completion=%s",
+                stage,
+                total_tokens,
+                context_window,
+                percentage_used,
+                prompt_tokens,
+                completion_tokens,
+            )
+        else:
+            logger.info(
+                "Context window usage (%s): total=%s tokens | prompt=%s completion=%s",
+                stage,
+                total_tokens,
+                prompt_tokens,
+                completion_tokens,
+            )
+
+    def _register_context_monitor_tools(self):
+        """Register tools that expose context stats and summaries."""
+        if not self.tool_manager or self._context_tools_registered:
+            return
+
+        def context_window_stats_tool() -> Dict[str, Any]:
+            """Return latest context window stats."""
+            return self.get_context_window_stats() or {}
+
+        def list_summary_registry_tool() -> Dict[str, Any]:
+            """List auto-generated summaries."""
+            return {"summaries": self.list_context_summaries()}
+
+        def fetch_summary_tool(summary_id: str) -> Dict[str, Any]:
+            """Fetch full summary content."""
+            summary = self.fetch_context_summary(summary_id)
+            return summary or {}
+
+        self.tool_manager.add_tool(context_window_stats_tool)
+        self.tool_manager.add_tool(list_summary_registry_tool)
+        self.tool_manager.add_tool(fetch_summary_tool)
+        self._context_tools_registered = True
+
+    def _maybe_generate_context_summary(self):
+        """Automatically summarize when context window nears limits."""
+        if not self.memory_provider or not hasattr(
+            self.memory_provider, "retrieve_by_id"
+        ):
+            return
+        if MemoryType.SUMMARIES not in self.active_memory_types:
+            return
+        stats = self._last_context_window_stats or {}
+        percentage_used = stats.get("percentage_used")
+        if percentage_used is None or percentage_used < self._context_summary_trigger:
+            return
+
+        import time
+
+        current_time = time.time()
+        if current_time - self._last_summary_timestamp < self._context_summary_cooldown:
+            return
+
+        summary_ids = self.generate_summaries(days_back=1, max_memories_per_summary=20)
+        if not summary_ids:
+            return
+
+        self._last_summary_timestamp = current_time
+        for summary_id in summary_ids:
+            if summary_id in self._known_summary_ids:
+                continue
+            try:
+                summary_doc = self.memory_provider.retrieve_by_id(
+                    summary_id, MemoryType.SUMMARIES
+                )
+            except Exception as exc:
+                logger.warning(f"Unable to load summary {summary_id}: {exc}")
+                summary_doc = None
+
+            short_description = ""
+            if summary_doc and summary_doc.get("content"):
+                short_description = summary_doc["content"][:160]
+
+            meta = {
+                "summary_id": summary_id,
+                "short_description": short_description,
+                "token_estimate": stats.get("total_tokens"),
+            }
+            self._summary_registry.append(meta)
+            self._known_summary_ids.add(summary_id)
+
+    def list_context_summaries(self) -> List[Dict[str, Any]]:
+        """Return summary registry entries."""
+        return list(self._summary_registry)
+
+    def fetch_context_summary(self, summary_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieve a stored summary document by ID."""
+        if not self.memory_provider or not hasattr(
+            self.memory_provider, "retrieve_by_id"
+        ):
+            return None
+        try:
+            return self.memory_provider.retrieve_by_id(summary_id, MemoryType.SUMMARIES)
+        except Exception as exc:
+            logger.warning("Failed to fetch summary %s: %s", summary_id, exc)
+            return None
+
     def _initialize_tools(self, tools):
         """Initialize tools using the tool manager."""
         if hasattr(tools, "__iter__") and not isinstance(tools, str):
@@ -161,6 +437,104 @@ class MemAgent:
         else:
             # Single tool or toolbox
             self.tool_manager.add_tool(tools)
+
+    def with_entity_memory(self, enabled: bool = True):
+        """
+        Enable or disable entity memory support at runtime.
+
+        Args:
+            enabled: True to expose entity memory tools/context, False to disable.
+
+        Returns:
+            Self for chaining.
+        """
+        manager_ready = (
+            self.entity_memory_manager and self.entity_memory_manager.is_enabled()
+        )
+
+        if enabled:
+            if not manager_ready:
+                logger.warning(
+                    "Cannot enable entity memory: memory provider does not support it."
+                )
+                self._entity_memory_enabled = False
+                return self
+
+            if not self._entity_memory_enabled:
+                self._entity_memory_enabled = True
+                self._register_entity_memory_tools()
+        else:
+            if self._entity_memory_enabled:
+                self._entity_memory_enabled = False
+                self._unregister_entity_memory_tools()
+
+        return self
+
+    def with_internet_access_provider(
+        self, provider: Optional["InternetAccessProvider"]
+    ):
+        """
+        Attach or detach an internet access provider.
+
+        Args:
+            provider: InternetAccessProvider instance or None to disable.
+
+        Returns:
+            Self for chaining.
+        """
+        if not self.internet_access_manager:
+            self.internet_access_manager = InternetAccessManager(provider)
+        else:
+            self.internet_access_manager.set_provider(provider)
+
+        # Reset failure tracking whenever provider changes
+        self._internet_access_failure_count = 0
+        self._internet_access_disabled_reason = None
+
+        if provider:
+            self._register_internet_access_tools()
+        else:
+            self._unregister_internet_access_tools()
+
+        return self
+
+    def has_internet_access(self) -> bool:
+        """Return True if an internet provider is configured."""
+        return bool(
+            self.internet_access_manager
+            and self.internet_access_manager.is_enabled()
+            and not self._internet_access_disabled_reason
+        )
+
+    def get_internet_access_provider_name(self) -> Optional[str]:
+        """Return the active internet provider name, if any."""
+        if not self.internet_access_manager:
+            return None
+        return self.internet_access_manager.get_provider_name()
+
+    def search_internet(
+        self, query: str, max_results: int = 5, **kwargs
+    ) -> List[Dict[str, Any]]:
+        """Expose direct search helper for callers."""
+        if not self.has_internet_access():
+            reason = (
+                self._internet_access_disabled_reason
+                or "No internet access provider configured"
+            )
+            raise ValueError(reason)
+        return self.internet_access_manager.search(
+            query=query, max_results=max_results, **kwargs
+        )
+
+    def fetch_url(self, url: str, **kwargs) -> Dict[str, Any]:
+        """Expose direct fetch helper."""
+        if not self.has_internet_access():
+            reason = (
+                self._internet_access_disabled_reason
+                or "No internet access provider configured"
+            )
+            raise ValueError(reason)
+        return self.internet_access_manager.fetch_url(url=url, **kwargs)
 
     def run(
         self, query: str, memory_id: str = None, conversation_id: str = None
@@ -258,6 +632,24 @@ class MemAgent:
             except Exception as e:
                 logger.warning(f"Failed to build memory context: {e}")
 
+        if (
+            self._entity_memory_enabled
+            and self.entity_memory_manager
+            and self.entity_memory_manager.is_enabled()
+        ):
+            try:
+                entity_context = self.entity_memory_manager.build_context(
+                    query=query, memory_id=memory_id
+                )
+                if entity_context:
+                    context["entity_memory_profiles"] = entity_context
+                self._last_entity_context = entity_context
+            except Exception as e:
+                logger.warning(f"Failed to retrieve entity memory context: {e}")
+                self._last_entity_context = []
+        else:
+            self._last_entity_context = []
+
         return context
 
     def _build_system_prompt(self) -> str:
@@ -280,6 +672,40 @@ class MemAgent:
                 prompt_parts.append(
                     f"Available tools:\n{chr(10).join(tool_descriptions)}"
                 )
+
+        if (
+            self._entity_memory_enabled
+            and self.entity_memory_manager
+            and self.entity_memory_manager.is_enabled()
+        ):
+            if self._last_entity_context:
+                entity_summary = self.entity_memory_manager.summarize_for_prompt(
+                    self._last_entity_context
+                )
+                if entity_summary:
+                    prompt_parts.append(
+                        "Entity memory facts:\n"
+                        + entity_summary
+                        + "\nUse the entity memory tools to keep these facts up to date."
+                    )
+            else:
+                prompt_parts.append(
+                    "Entity memory usage:\n"
+                    "- Before answering, call 'entity_memory_lookup' when the user references known people or when recalling prior facts might help.\n"
+                    "- After the user shares stable personal info (name, preferences, background, ongoing projects, likes/dislikes), call 'entity_memory_upsert' with the attribute/value pair so it persists.\n"
+                    "- Only store verifiable statements; skip speculative or time-sensitive details.\n"
+                    "- Always keep JSON fields descriptive (e.g., attribute 'favorite_hobby', value 'hiking in the mountains')."
+                )
+
+        if self.has_internet_access():
+            provider_name = (
+                self.get_internet_access_provider_name() or "internet provider"
+            )
+            prompt_parts.append(
+                f"Internet access ({provider_name}):\n"
+                "- Call 'internet_search' to look up fresh information online.\n"
+                "- Call 'open_web_page' when you need to read a specific URL."
+            )
 
         return "\n\n".join(prompt_parts)
 
@@ -373,6 +799,7 @@ class MemAgent:
             for iteration in range(max_iterations):
                 # Call LLM
                 response = self.model.generate(messages, tools=tools)
+                self._record_context_window_usage(stage=f"iteration_{iteration + 1}")
 
                 # Check if response is a string (no tool calls)
                 if isinstance(response, str):
@@ -553,6 +980,204 @@ class MemAgent:
 
             return f"I encountered an error while processing your request: {str(e)}"
 
+    def _register_entity_memory_tools(self):
+        """Register built-in tools that expose entity memory to the LLM."""
+        if not (
+            self.tool_manager
+            and self.entity_memory_manager
+            and self.entity_memory_manager.is_enabled()
+        ):
+            return
+
+        if self._entity_memory_tools_registered:
+            return
+
+        def entity_memory_lookup(
+            entity_id: str = None,
+            name: str = None,
+            query: str = None,
+            limit: int = 5,
+        ) -> Dict[str, Any]:
+            """Search structured entity memory by id, name, or semantic query."""
+            resolved_memory_id = self._current_memory_id or (
+                self.memory_ids[0] if self.memory_ids else None
+            )
+            matches = self.entity_memory_manager.lookup_entities(
+                entity_id=entity_id,
+                name=name,
+                query=query,
+                limit=limit,
+                memory_id=resolved_memory_id,
+            )
+            logger.info(
+                "entity_memory_lookup returned %s record(s) (memory_id=%s)",
+                len(matches),
+                resolved_memory_id,
+            )
+            return {"matches": matches}
+
+        def _normalize_attributes(attrs):
+            """Normalize attributes from various formats to list of dicts with name/value."""
+            if not attrs:
+                return None
+            if isinstance(attrs, str):
+                if not attrs.strip():
+                    return None
+                try:
+                    parsed = json.loads(attrs)
+                    if isinstance(parsed, dict):
+                        return [{"name": k, "value": str(v)} for k, v in parsed.items()]
+                    return parsed if isinstance(parsed, list) else None
+                except (json.JSONDecodeError, TypeError):
+                    return None
+            if isinstance(attrs, dict):
+                return [{"name": k, "value": str(v)} for k, v in attrs.items()]
+            return attrs if isinstance(attrs, list) else None
+
+        def _normalize_json_field(field, expected_type):
+            """Normalize JSON string fields to expected type."""
+            if not field:
+                return None
+            if isinstance(field, str):
+                if not field.strip() or field.strip() == "{}":
+                    return None
+                try:
+                    parsed = json.loads(field)
+                    return parsed if isinstance(parsed, expected_type) else None
+                except (json.JSONDecodeError, TypeError):
+                    return None
+            return field if isinstance(field, expected_type) else None
+
+        def entity_memory_upsert(
+            entity_id: str = None,
+            name: str = None,
+            entity_type: str = None,
+            attributes: Optional[List[Dict[str, Any]]] = None,
+            relations: Optional[List[Dict[str, Any]]] = None,
+            metadata: Optional[Dict[str, Any]] = None,
+            memory_id: str = None,
+        ) -> Dict[str, Any]:
+            """Insert or update a structured entity record."""
+            resolved_memory_id = (
+                memory_id
+                or self._current_memory_id
+                or (self.memory_ids[0] if self.memory_ids else None)
+            )
+            if resolved_memory_id is None:
+                raise ValueError("A memory_id is required to store entity information.")
+
+            new_entity_id = self.entity_memory_manager.upsert_entity_from_tool(
+                entity_id=entity_id,
+                name=name,
+                entity_type=entity_type,
+                attributes=_normalize_attributes(attributes),
+                relations=_normalize_json_field(relations, list),
+                metadata=_normalize_json_field(metadata, dict),
+                memory_id=resolved_memory_id,
+            )
+            logger.info(
+                "entity_memory_upsert stored entity_id=%s (memory_id=%s)",
+                new_entity_id,
+                resolved_memory_id,
+            )
+            return {"entity_id": new_entity_id}
+
+        entity_memory_lookup.__name__ = "entity_memory_lookup"
+        entity_memory_upsert.__name__ = "entity_memory_upsert"
+
+        self.tool_manager.add_tool(entity_memory_lookup)
+        self.tool_manager.add_tool(entity_memory_upsert)
+        self._entity_memory_tools_registered = True
+
+    def _register_internet_access_tools(self):
+        """Register tools that expose internet search and browsing."""
+        if not (
+            self.tool_manager
+            and self.internet_access_manager
+            and self.internet_access_manager.is_enabled()
+        ):
+            return
+
+        if self._internet_access_tools_registered:
+            return
+
+        def internet_search(query: str, max_results: int = 5) -> Dict[str, Any]:
+            """Search the public internet for up-to-date information."""
+            try:
+                if self._internet_access_disabled_reason:
+                    return {
+                        "error": f"Internet access disabled: {self._internet_access_disabled_reason}"
+                    }
+                results = self.internet_access_manager.search(
+                    query=query, max_results=max_results
+                )
+                self._internet_access_failure_count = 0
+                return {"results": results}
+            except Exception as exc:
+                logger.error("internet_search failed: %s", exc)
+                return self._handle_internet_access_error(str(exc))
+
+        def open_web_page(url: str) -> Dict[str, Any]:
+            """Fetch and summarize the contents of a website."""
+            try:
+                if self._internet_access_disabled_reason:
+                    return {
+                        "error": f"Internet access disabled: {self._internet_access_disabled_reason}"
+                    }
+                page = self.internet_access_manager.fetch_url(url=url)
+                self._internet_access_failure_count = 0
+                return page
+            except Exception as exc:
+                logger.error("open_web_page failed: %s", exc)
+                return self._handle_internet_access_error(str(exc))
+
+        internet_search.__name__ = "internet_search"
+        open_web_page.__name__ = "open_web_page"
+
+        self.tool_manager.add_tool(internet_search)
+        self.tool_manager.add_tool(open_web_page)
+        self._internet_access_tools_registered = True
+
+    def _unregister_entity_memory_tools(self):
+        """Remove entity memory tools from the tool manager."""
+        if not self.tool_manager or not self._entity_memory_tools_registered:
+            return
+
+        for tool_name in self._entity_memory_tool_names:
+            self.tool_manager.remove_tool(tool_name)
+
+        self._entity_memory_tools_registered = False
+
+    def _unregister_internet_access_tools(self):
+        """Remove internet access tools when provider is disabled."""
+        if not self.tool_manager or not self._internet_access_tools_registered:
+            return
+
+        for tool_name in self._internet_access_tool_names:
+            self.tool_manager.remove_tool(tool_name)
+
+        self._internet_access_tools_registered = False
+
+    def _handle_internet_access_error(self, message: str) -> Dict[str, Any]:
+        """Track repeated provider failures and disable tools after threshold."""
+        self._internet_access_failure_count += 1
+        if (
+            self._internet_access_failure_count >= 3
+            and not self._internet_access_disabled_reason
+        ):
+            self._internet_access_disabled_reason = (
+                "Internet access temporarily disabled after repeated failures."
+            )
+            logger.warning(
+                "Disabling internet access tools after %s failures.",
+                self._internet_access_failure_count,
+            )
+        return {
+            "error": message
+            if not self._internet_access_disabled_reason
+            else f"{message} | {self._internet_access_disabled_reason}"
+        }
+
     def _record_interaction(
         self, query: str, response: str, memory_id: str, conversation_id: str
     ):
@@ -714,6 +1339,12 @@ class MemAgent:
                 return self.memory_manager.load_conversation_history(memory_id)
         return []
 
+    def get_context_window_stats(self) -> Optional[Dict[str, Any]]:
+        """Return the most recent context window usage snapshot."""
+        if not self._last_context_window_stats:
+            return None
+        return dict(self._last_context_window_stats)
+
     def add_tool(self, tool, persist: bool = False):
         """Add a tool (delegated to tool manager)."""
         return self.tool_manager.add_tool(tool, persist)
@@ -756,6 +1387,7 @@ class MemAgent:
                 ),
                 instruction=self.instruction,
                 max_steps=self.max_steps,
+                application_mode=self._get_application_mode_value(),
                 memory_ids=self.memory_ids,
                 agent_id=self.agent_id,
                 persona=(
@@ -769,6 +1401,13 @@ class MemAgent:
                     self.cache_manager.enabled if self.cache_manager else False
                 ),
                 semantic_cache_config=semantic_cache_config_to_save,
+                context_window_tokens=self._context_window_tokens,
+                internet_access_provider=self.get_internet_access_provider_name(),
+                internet_access_config=(
+                    self.internet_access_manager.get_provider_config()
+                    if self.has_internet_access()
+                    else None
+                ),
             )
 
             # Save or update the agent
@@ -822,6 +1461,14 @@ class MemAgent:
         except Exception as e:
             logger.error(f"Failed to save MemAgent {self.agent_id}: {e}")
             raise
+
+    def _get_application_mode_value(self) -> str:
+        """Return the application mode value as a string."""
+        if isinstance(self.application_mode, ApplicationMode):
+            return self.application_mode.value
+        if isinstance(self.application_mode, str):
+            return self.application_mode
+        return ApplicationMode.DEFAULT.value
 
     def _serialize_tools_for_save(self):
         """Serialize tools for saving."""
@@ -997,6 +1644,31 @@ class MemAgent:
             except Exception as e:
                 logger.warning(f"Failed to reconstruct semantic cache config: {e}")
 
+        internet_provider_instance = None
+        if hasattr(saved_memagent, "internet_access_provider"):
+            provider_name = getattr(saved_memagent, "internet_access_provider", None)
+            provider_config = getattr(saved_memagent, "internet_access_config", None)
+            if provider_name:
+                try:
+                    from ..internet_access import create_internet_access_provider
+
+                    internet_provider_instance = create_internet_access_provider(
+                        provider_name, provider_config
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "Failed to restore internet provider '%s': %s",
+                        provider_name,
+                        exc,
+                    )
+
+        application_mode_to_use = overrides.get("application_mode")
+        if not application_mode_to_use:
+            if getattr(saved_memagent, "application_mode", None):
+                application_mode_to_use = saved_memagent.application_mode
+            else:
+                application_mode_to_use = ApplicationMode.DEFAULT.value
+
         # Create new agent instance with loaded configuration
         agent_instance = cls(
             model=overrides.get("model", model_to_load),
@@ -1013,12 +1685,16 @@ class MemAgent:
             ),
             agent_id=agent_id,
             memory_provider=memory_provider,
+            application_mode=application_mode_to_use,
             delegates=overrides.get("delegates", loaded_delegates),
             semantic_cache=overrides.get(
                 "semantic_cache", getattr(saved_memagent, "semantic_cache", False)
             ),
             semantic_cache_config=overrides.get(
                 "semantic_cache_config", semantic_cache_config_to_load
+            ),
+            internet_access_provider=overrides.get(
+                "internet_access_provider", internet_provider_instance
             ),
         )
 
@@ -1338,6 +2014,7 @@ Provide a comprehensive but concise summary:"""
             if self.model:
                 messages = [{"role": "user", "content": compression_prompt}]
                 summary = self.model.generate(messages)
+                self._record_context_window_usage(stage="memory_compression")
                 return summary.strip()
             else:
                 logger.warning("No LLM model available for memory compression")

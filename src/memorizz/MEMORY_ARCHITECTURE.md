@@ -10,7 +10,8 @@ The MemoRizz memory system is organized into **cognitively-inspired categories**
 src/memorizz/
 ├── long_term_memory/           # Persistent, learned information
 │   ├── semantic/              # Facts, concepts, knowledge
-│   ├── procedural/            # Skills, behaviors, processes  
+│   │   └── entity_memory/     # Structured facts about specific entities
+│   ├── procedural/            # Skills, behaviors, processes
 │   └── episodic/              # Experiences, events, history
 ├── short_term_memory/         # Temporary, active processing
 │   ├── semantic_cache/        # Temporary fact storage
@@ -24,8 +25,8 @@ src/memorizz/
 ### 🔍 Semantic Memory (`long_term_memory/semantic/`)
 **"What I know"** - Factual and conceptual knowledge
 
-- **Purpose**: Store and retrieve objective facts, concepts, and general knowledge
-- **Components**: Knowledge Base, Persona (identity/behavior)
+- **Purpose**: Store and retrieve objective facts, concepts, and structured entity information
+- **Components**: Knowledge Base, Persona (identity/behavior), Entity Memory
 - **Use Cases**: Question answering, fact retrieval, domain expertise
 - **Examples**: "Python is a programming language", "The capital of France is Paris"
 
@@ -34,7 +35,13 @@ src/memorizz/
 - Namespace organization by domain
 - Agent-scoped knowledge bases
 - Embedding-powered relevance matching
+- Entity memory for persistent attribute–value pairs tied to specific people, products, or organizations
 - **Persona**: Behavioral patterns and identity consistency
+- **Entity Memory**: Structured profiles with attributes, relations, and provenance that survive across sessions
+
+Entity memory enables personalization and consistent reasoning: every agent can recall
+stable facts (preferences, org metadata, device details, etc.), update them with new
+evidence, and expose the information to LLMs via dedicated lookup/upsert tools.
 
 ### ⚙️ Procedural Memory (`long_term_memory/procedural/`)
 **"How I act and what I can do"** - Behavioral patterns and executable skills
@@ -80,7 +87,7 @@ src/memorizz/
 
 **Key Features:**
 - Context window optimization for LLMs
-- Memory system integration and coordination  
+- Memory system integration and coordination
 - Dynamic prompt generation
 - Attention management and focus control
 
@@ -106,19 +113,19 @@ src/memorizz/
 ```mermaid
 graph TD
     WM[Working Memory] --> SM[Semantic Memory]
-    WM --> EM[Episodic Memory]  
+    WM --> EM[Episodic Memory]
     WM --> PM[Procedural Memory]
     WM --> SC[Semantic Cache]
-    
+
     SM --> KB[Knowledge Base]
     SM --> P[Persona]
     PM --> T[Toolbox]
     PM --> W[Workflow]
     EM --> CM[Conversational Memory]
     EM --> SU[Summaries]
-    
+
     SHM[Shared Memory] --> WM
-    
+
     style WM fill:#ff9999
     style SM fill:#99ccff
     style PM fill:#99ff99
@@ -134,7 +141,7 @@ Different application modes activate different memory combinations:
 # ASSISTANT Mode - General conversational agent
 active_memory_types = [
     MemoryType.CONVERSATION_MEMORY,    # Episodic
-    MemoryType.LONG_TERM_MEMORY,       # Semantic 
+    MemoryType.LONG_TERM_MEMORY,       # Semantic
     MemoryType.PERSONAS,               # Procedural
     MemoryType.SHORT_TERM_MEMORY,      # Working
     MemoryType.SUMMARIES               # Episodic compression
@@ -173,7 +180,7 @@ agent = MemAgent(
 
 # Memory systems work together automatically:
 response = agent.run("Remember our Python discussion from yesterday?")
-# Uses: episodic (yesterday's conversation) + semantic (Python knowledge) + 
+# Uses: episodic (yesterday's conversation) + semantic (Python knowledge) +
 #       procedural (how to help) + working (current context)
 ```
 
@@ -202,7 +209,7 @@ from memorizz.long_term_memory.semantic import KnowledgeBase
 kb = KnowledgeBase(memory_provider)
 kb.ingest_knowledge("AI knowledge...", namespace="artificial_intelligence")
 
-# Procedural memory - Skill and behavior management  
+# Procedural memory - Skill and behavior management
 from memorizz.long_term_memory.procedural import Persona, Toolbox
 persona = Persona("TechExpert", "Technical Support Specialist")
 toolbox = Toolbox(memory_provider)
@@ -237,7 +244,7 @@ from memorizz.persona import Persona
 from memorizz.toolbox import Toolbox
 from memorizz.shared_memory import SharedMemory
 
-# NEW imports  
+# NEW imports
 from memorizz.long_term_memory.semantic.persona import Persona
 from memorizz.long_term_memory.procedural.toolbox import Toolbox
 from memorizz.coordination.shared_memory import SharedMemory
@@ -259,7 +266,7 @@ from memorizz import MemAgent, Persona, Toolbox, KnowledgeBase
 
 1. **Cognitive Clarity**: Maps to established cognitive science memory types
 2. **Modular Design**: Each memory type can be used independently or together
-3. **Scalable Coordination**: Supports both single and multi-agent scenarios  
+3. **Scalable Coordination**: Supports both single and multi-agent scenarios
 4. **Performance Optimization**: Working memory manages context windows effectively
 5. **Developer Experience**: Clear separation of concerns and comprehensive documentation
 
